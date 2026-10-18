@@ -61,12 +61,13 @@ export function parseRuleSource(text: string, rules: Rules): void {
 			continue;
 		}
 
-		// hosts: "ip domain [domain...]"
+		// hosts: "ip domain [domain...] [# inline comment]"
 		const first = line.split(/\s+/)[0];
 		if (isIpv4(first)) {
 			for (const dom of line.split(/\s+/).slice(1)) {
+				if (dom.startsWith("#")) break; // inline comment: rest of line
 				const d = dom.toLowerCase().replace(/\.+$/, "");
-				if (!d) continue;
+				if (!/^[a-z0-9._-]+$/.test(d)) continue;
 				if (first === "0.0.0.0") rules.blocked.add(d);
 				else rules.hosts.set(d, first);
 			}
