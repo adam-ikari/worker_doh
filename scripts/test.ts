@@ -11,7 +11,7 @@ import {
 	RCODE_NXDOMAIN,
 } from "../src/dnsmsg";
 import { isBlocked, lookupHost, parseRuleSource } from "../src/rules";
-import { canonicalOpts, optsHash, optsToParams, parseOpts } from "../src/opts";
+import { canonicalOpts, hasOpts, optsHash, optsToParams, parseOpts } from "../src/opts";
 
 let passed = 0;
 async function ok(name: string, fn: () => void | Promise<void>): Promise<void> {
@@ -114,7 +114,7 @@ await ok("minAnswerTtl scans answers with compressed names", () => {
 });
 
 await ok("rules parse adblock/hosts/dnsmasq formats", () => {
-	const rules = { blocked: new Set<string>(), hosts: new Map<string, string>(), updatedAt: 0 };
+	const rules = { blocked: new Set<string>(), allowed: new Set<string>(), hosts: new Map<string, string>(), updatedAt: 0 };
 	parseRuleSource(
 		[
 			"# comment",
@@ -134,6 +134,50 @@ await ok("rules parse adblock/hosts/dnsmasq formats", () => {
 	assert.equal(lookupHost(rules, "my.home"), "1.2.3.4");
 	assert.equal(lookupHost(rules, "x.com"), "9.9.9.9");
 	assert.equal(isBlocked(rules, "wrapped.info"), true);
+});
+
+await ok("rules: AGH-style exceptions, wildcards, skipped syntax", () => {
+	const rules = { blocked: new Set<string>(), allowed: new Set<string>(), hosts: new Map<string, string>(), updatedAt: 0 };
+	parseRuleSource(
+		[
+			"||ads.a^",
+			"*.wild.b^",
+			"@@||ok.a^",
+			"@@plain.c",
+			"x.com$important", // modifier on a plain domain: not a recognizable rule
+			"##.banner", // cosmetic
+			"~/regex\\.rule", // full regex
+			"address=/fix.c/5.6.7.8",
+			"||hosts-block.d^",
+		].join("\n"),
+		rules,
+	);
+	assert.ok(isBlocked(rules, "sub.ads.a"));
+	assert.ok(isBlocked(rules, "x.y.wild.b")); // *.wild.b^ wildcard
+	assert.equal(isBlocked(rules, "ads.ok.a"), false); // allowed parent covers the whole subtree
+	assert.ok(isBlocked(rules, "ads.a")); // unrelated block rule still applies
+	assert.equal(isBlocked(rules, "ok.a"), false);
+	assert.equal(isBlocked(rules, "www.plain.c"), false);
+	assert.equal(isBlocked(rules, "x.com"), false); // $important line not parsed as a rule
+	assert.equal(isBlocked(rules, "regex.rule"), false);
+	assert.equal(lookupHost(rules, "fix.c"), "5.6.7.8");
+	// exception beats a hosts override too
+	rules.hosts.set("mail.ok.a", "9.9.9.9");
+	assert.equal(lookupHost(rules, "mail.ok.a"), null);
+});
+
+await ok("opts: allow round-trips and partitions the cache hash", async () => {
+	const a = parseOpts(new URLSearchParams("block=x.com&allow=y.com"));
+	assert.ok(a.ok);
+	assert.deepEqual(a.opts.allow, ["y.com"]);
+	assert.ok(hasOpts(a.opts));
+	const b = parseOpts(optsToParams(a.opts));
+	assert.ok(b.ok);
+	assert.equal(canonicalOpts(b.opts), canonicalOpts(a.opts));
+	const c = parseOpts(new URLSearchParams("block=x.com"));
+	assert.ok(c.ok);
+	assert.notEqual(await optsHash(a.opts), await optsHash(c.opts));
+	assert.ok(!parseOpts(new URLSearchParams("allow=bad domain")).ok);
 });
 
 await ok("opts parse, validate, and reject SSRF-ish urls", () => {

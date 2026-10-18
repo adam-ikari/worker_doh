@@ -13,7 +13,8 @@ const CORS = {
 };
 
 export function configPage(url: URL): Response {
-	const host = escapeHtml(url.host);	const html = `<!doctype html>
+	const host = escapeHtml(url.host);
+	const html = `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>DoH 配置页</title>
@@ -47,14 +48,17 @@ export function configPage(url: URL): Response {
 <label>封禁域名 <small class="hint">逗号分隔，子域一并封禁（block=）</small></label>
 <textarea id="block" placeholder="ads.example.com, tracker.example.net"></textarea>
 
+<label>例外域名（白名单） <small class="hint">逗号分隔，优先于一切拦截/固定解析，含子域（allow=）</small></label>
+<input id="allow" placeholder="ok.example.com, mail.example.net">
+
 <label>域名固定解析 <small class="hint">每行一条，域名/IP（host=）</small></label>
 <textarea id="host" placeholder="router.home/192.168.1.1&#10;nas.home/192.168.1.9"></textarea>
 
 <label>上游 DoH 覆盖 <small class="hint">逗号分隔，仅 https，留空则用服务器默认（up=）</small></label>
 <input id="up" placeholder="https://dns.google/dns-query">
 
-<label>订阅 blocklist <small class="hint">逗号分隔 URL，adblock/hosts/dnsmasq 格式（list=）</small></label>
-<input id="list" placeholder="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts">
+<label>订阅过滤器 <small class="hint">每行一个 URL（最多 4 个）。支持 <code>||域^</code> 拦截、<code>@@||域^</code> 例外、<code>*.域</code> 通配、hosts、dnsmasq <code>address=</code>；regex/$修饰符/##元素规则自动跳过（list=）</small></label>
+<textarea id="list" placeholder="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts&#10;https://adguard-dns.io/filter.txt"></textarea>
 
 <h2 style="font-size:1.1rem;margin-top:1.6rem">等价 /p/ 形式</h2>
 <div class="out"><div class="row"><span id="purl" style="flex:1"></span>
@@ -74,17 +78,19 @@ export function configPage(url: URL): Response {
 <table>
 <tr><th>参数</th><th>作用</th></tr>
 <tr><td><code>block</code></td><td>逗号分隔域名，命中返回 NXDOMAIN，后缀匹配（<code>x.com</code> 含子域）</td></tr>
+<tr><td><code>allow</code></td><td>例外域名（白名单），优先于 block、host 固定解析与订阅拦截</td></tr>
 <tr><td><code>host</code></td><td><code>域名/IP</code> 逗号（或换行）分隔，固定 A 应答</td></tr>
 <tr><td><code>up</code></td><td>本次请求的上游 DoH 列表（https、最多 8 个），覆盖服务器默认</td></tr>
-<tr><td><code>list</code></td><td>远程 blocklist URL（最多 4 个），内容同服务器订阅格式，结果缓存 10 分钟</td></tr>
+<tr><td><code>list</code></td><td>远程过滤器 URL（最多 4 个）：支持 <code>||域^</code>/<code>@@||域^</code>/<code>*.域</code>/hosts/dnsmasq，其余语法跳过；结果缓存 10 分钟</td></tr>
 </table>
+<p>表单内容保存在<b>本浏览器</b>（localStorage），下次打开自动恢复；服务器依旧无状态。</p>
 <p>客户端接入：浏览器「安全 DNS」直接粘贴 DoH URL；Chrome/Edge 命令行
 <code>--custom-profile --dns-over-https-mode=secure --dns-over-https-server="…"</code>；
 macOS 描述文件 <code>DNSOverride</code>；Linux 用 <code>doh-proxy</code>/stubby 转发到本端点。</p>
 </details>
 
 <div class="warn"><b>注意</b>：配置随 URL 明文传输、无鉴权。任何拿到该 URL 的人即可看到并复用你的
-block/host/up/list；请勿在 URL 中使用含有隐私的内部域名。需要隐藏时改用上方 <code>/p/</code> 形式（仅编码，不加密）。</div>
+block/host/allow/up/list；请勿在 URL 中使用含有隐私的内部域名。需要隐藏时改用上方 <code>/p/</code> 形式（仅编码，不加密）。</div>
 
 <script>${JS}</script>
 </body></html>`;
@@ -100,11 +106,13 @@ function buildParams() {
   const p = new URLSearchParams();
   const b = $("block").value.split(/[\s,]+/).map(s => s.trim()).filter(Boolean).join(",");
   if (b) p.set("block", b);
+  const a = $("allow").value.split(/[\s,]+/).map(s => s.trim()).filter(Boolean).join(",");
+  if (a) p.set("allow", a);
   const h = readHosts();
   if (h) p.set("host", h);
   const u = $("up").value.split(/[\s,]+/).map(s => s.trim()).filter(Boolean).join(",");
   if (u) p.set("up", u);
-  const l = $("list").value.split(/[\s,]+/).map(s => s.trim()).filter(Boolean).join(",");
+  const l = $("list").value.split(/\n+/).map(s => s.trim()).filter(Boolean).join(",");
   if (l) p.set("list", l);
   return p;
 }
@@ -122,7 +130,22 @@ function refresh() {
   const cfg = b64url(qs ? "?" + qs : "");
   $("purl").textContent = cfg ? origin + "/p/" + cfg : origin + "/dns-query";
 }
-["block", "host", "up", "list"].forEach(id => $(id).addEventListener("input", refresh));
+const FIELDS = ["block", "allow", "host", "up", "list"];
+const LS = "doh-config-page";
+try {
+  const saved = JSON.parse(localStorage.getItem(LS) || "{}");
+  FIELDS.forEach(id => { if (typeof saved[id] === "string") $(id).value = saved[id]; });
+} catch { /* first visit */ }
+let saveT;
+function persist() {
+  clearTimeout(saveT);
+  saveT = setTimeout(() => {
+    const o = {};
+    FIELDS.forEach(id => { o[id] = $(id).value; });
+    try { localStorage.setItem(LS, JSON.stringify(o)); } catch { /* private mode */ }
+  }, 300);
+}
+FIELDS.forEach(id => $(id).addEventListener("input", () => { refresh(); persist(); }));
 document.querySelectorAll("[data-copy]").forEach(btn => btn.addEventListener("click", async () => {
   const t = $(btn.dataset.copy).textContent;
   try { await navigator.clipboard.writeText(t); btn.textContent = "已复制"; setTimeout(() => btn.textContent = "复制" + (btn.dataset.copy === "doh" ? " DoH URL" : ""), 1200); }

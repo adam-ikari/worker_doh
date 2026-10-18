@@ -6,6 +6,7 @@
  * `optsToParams` — one codec for both sides):
  *
  *   block=ads.x,tracker.y          domains answered NXDOMAIN (suffix match)
+ *   allow=ok.x                     exception domains, never filtered (beats block/hosts)
  *   host=home.lan/192.168.1.5,...  fixed A answers
  *   up=https://dns.google/dns-query,...  upstream override (else env/default)
  *   list=https://.../hosts         extra blocklist URL (adblock/hosts/dnsmasq)
@@ -18,6 +19,7 @@
 
 export interface RequestOpts {
 	block: string[];
+	allow: string[];
 	hosts: Map<string, string>;
 	up: string[];
 	list: string[];
@@ -60,12 +62,14 @@ function checkUrl(s: string, what: string): string | null {
 }
 
 export function parseOpts(sp: URLSearchParams): OptsResult {
-	const opts: RequestOpts = { block: [], hosts: new Map(), up: [], list: [] };
+	const opts: RequestOpts = { block: [], allow: [], hosts: new Map(), up: [], list: [] };
 
-	for (const raw of splitList(sp.get("block"))) {
-		const d = normDomain(raw);
-		if (!d) return err(`block: bad domain: ${raw}`);
-		opts.block.push(d);
+	for (const key of ["block", "allow"] as const) {
+		for (const raw of splitList(sp.get(key))) {
+			const d = normDomain(raw);
+			if (!d) return err(`${key}: bad domain: ${raw}`);
+			opts[key].push(d);
+		}
 	}
 
 	for (const raw of splitList(sp.get("host"))) {
@@ -96,6 +100,7 @@ export function parseOpts(sp: URLSearchParams): OptsResult {
 	if (ups.length > MAX_UP) return err(`up: too many entries (max ${MAX_UP})`);
 	if (lists.length > MAX_LIST) return err(`list: too many entries (max ${MAX_LIST})`);
 	if (opts.block.length > MAX_BLOCK) return err(`block: too many entries (max ${MAX_BLOCK})`);
+	if (opts.allow.length > MAX_BLOCK) return err(`allow: too many entries (max ${MAX_BLOCK})`);
 	if (opts.hosts.size > MAX_HOSTS) return err(`host: too many entries (max ${MAX_HOSTS})`);
 
 	return { ok: true, opts };
@@ -111,13 +116,14 @@ function err(error: string): OptsResult {
 }
 
 export function hasOpts(o: RequestOpts): boolean {
-	return o.block.length > 0 || o.hosts.size > 0 || o.up.length > 0 || o.list.length > 0;
+	return o.block.length > 0 || o.allow.length > 0 || o.hosts.size > 0 || o.up.length > 0 || o.list.length > 0;
 }
 
 /** Stable, order-insensitive encoding — same config always yields same string. */
 export function canonicalOpts(o: RequestOpts): string {
 	const parts: string[] = [];
 	if (o.block.length) parts.push(`b=${[...new Set(o.block)].sort().join(",")}`);
+	if (o.allow.length) parts.push(`a=${[...new Set(o.allow)].sort().join(",")}`);
 	if (o.hosts.size) parts.push(`h=${[...o.hosts.entries()].sort().map(([d, i]) => `${d}/${i}`).join(",")}`);
 	if (o.up.length) parts.push(`u=${[...new Set(o.up)].sort().join(",")}`);
 	if (o.list.length) parts.push(`l=${[...new Set(o.list)].sort().join(",")}`);
@@ -133,6 +139,7 @@ export async function optsHash(o: RequestOpts): Promise<string> {
 export function optsToParams(o: RequestOpts): URLSearchParams {
 	const sp = new URLSearchParams();
 	if (o.block.length) sp.set("block", [...o.block].sort().join(","));
+	if (o.allow.length) sp.set("allow", [...o.allow].sort().join(","));
 	if (o.hosts.size) sp.set("host", [...o.hosts.entries()].sort().map(([d, i]) => `${d}/${i}`).join(","));
 	if (o.up.length) sp.set("up", [...o.up].sort().join(","));
 	if (o.list.length) sp.set("list", [...o.list].sort().join(","));

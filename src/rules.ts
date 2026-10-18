@@ -1,18 +1,25 @@
 /**
- * Custom rules: block domains and/or override them with fixed IPs.
+ * Filtering rules in the AdGuard-Home "DNS filters" sense, at the DNS layer:
+ * block domains, allow exceptions, override with fixed IPs.
  *
  * Sources (merged):
- *  - BLOCK_DOMAINS env var: comma/space separated domains to block
- *  - BLOCKLIST_URL env var: remote file, refreshed periodically, parsed as a
- *    mix of adblock-style, hosts-style and dnsmasq address-style rules:
+ *  - BLOCK_DOMAINS / ALLOW_DOMAINS env vars: comma/space separated lists
+ *  - BLOCKLIST_URL env var: comma-separated remote filter URLs, each
+ *    refreshed every 6h, parsed as a domain-level subset of the rule syntax
+ *    commonly found in adblock/hosts/dnsmasq subscriptions:
  *
  *      example.com            -> block
- *      ||ads.example.com^     -> block
+ *      ||ads.example.com^     -> block  (AGH wildcard behaviour: suffix match)
+ *      *.wild.example.com     -> block  (leading "*." stripped)
+ *      @@||ok.example.com^    -> allow (exception; beats block and hosts)
  *      0.0.0.0 ads.com        -> block (hosts file)
  *      1.2.3.4 my.home        -> serve A 1.2.3.4 (hosts file)
  *      address=/x.com/1.2.3.4 -> serve A (dnsmasq)
  *
- * Everything else (comments, wildcards, ABP filters) is ignored.
+ * Unsupported lines are skipped: full-regex rules (~...), $-modifier ABP
+ * filters, cosmetic/elemhide (##) rules, comments.
+ *
+ * Precedence: allowed > hosts override > blocked > upstream resolution.
  */
 
 import type { Env } from "./types";
@@ -20,6 +27,8 @@ import type { RequestOpts } from "./opts";
 
 export interface Rules {
 	blocked: Set<string>;
+	/** exception domains: a name at or under one of these is never filtered */
+	allowed: Set<string>;
 	/** domain -> IPv4 */
 	hosts: Map<string, string>;
 	updatedAt: number;
@@ -29,7 +38,7 @@ const RULES_TTL_MS = 6 * 60 * 60 * 1000; // refetch blocklist every 6h
 const FETCH_TIMEOUT_MS = 15_000;
 
 function emptyRules(): Rules {
-	return { blocked: new Set(), hosts: new Map(), updatedAt: 0 };
+	return { blocked: new Set(), allowed: new Set(), hosts: new Map(), updatedAt: 0 };
 }
 
 function isIpv4(s: string): boolean {
@@ -42,6 +51,15 @@ export function parseRuleSource(text: string, rules: Rules): void {
 	for (const raw of text.split(/\r?\n|\f/)) {
 		const line = raw.trim();
 		if (!line || /^[#;!\/]/.test(line)) continue;
+		// cosmetic / regex / element-hidden rules: no DNS-layer meaning
+		if (/^(##|#@#|~)/.test(line)) continue;
+
+		// exception rule: @@||domain^[$modifiers] — whitelist, beats everything
+		if (line.startsWith("@@")) {
+			const d = normRuleDomain(line.slice(2).split("$")[0]);
+			if (d) rules.allowed.add(d);
+			continue;
+		}
 
 		// hosts: "ip domain [domain...]"
 		const first = line.split(/\s+/)[0];
@@ -70,17 +88,24 @@ export function parseRuleSource(text: string, rules: Rules): void {
 			continue;
 		}
 
-		// adblock: ||domain^ (whitelisting @@ and unsupported filters are skipped)
+		// adblock: ||domain^ (with optional $modifiers); *.domain wildcard form
 		const abp = line.match(/^\|\|([a-z0-9._-]+?)\^/i);
 		if (abp) {
 			rules.blocked.add(abp[1].toLowerCase().replace(/\.+$/, ""));
 			continue;
 		}
 
-		// plain domain line
-		const d = line.toLowerCase().replace(/\.+$/, "").split(/\s+/)[0];
-		if (/^[a-z0-9._-]+$/.test(d)) rules.blocked.add(d);
+		// plain domain line (or *.domain — same suffix semantics as AGH wildcards)
+		const d = normRuleDomain(line.split(/\s+/)[0]);
+		if (d) rules.blocked.add(d);
 	}
+}
+
+/** "*.dom" / "dom." / "||dom^" → "dom"; null when not a plain domain rule. */
+function normRuleDomain(s: string): string | null {
+	const d = s.replace(/^\*\./, "").replace(/^\|\|/, "").replace(/\^.*$/, "").toLowerCase().replace(/\.+$/, "");
+	if (!d || !/^[a-z0-9._-]+$/.test(d)) return null;
+	return d;
 }
 
 let rulesState: { rules: Rules; at: number } | null = null;
@@ -88,29 +113,24 @@ let rulesPending: Promise<Rules> | null = null;
 
 async function loadRules(env: Env): Promise<Rules> {
 	const rules = emptyRules();
-	if (env.BLOCK_DOMAINS) {
-		for (const d of env.BLOCK_DOMAINS.split(/[\s,]+/)) {
-			const dom = d.trim().toLowerCase().replace(/\.+$/, "");
-			if (dom) rules.blocked.add(dom);
-		}
-	}
-	if (env.BLOCKLIST_URL) {
-		const { signal, clear } = timeout(FETCH_TIMEOUT_MS);
-		try {
-			const res = await fetch(env.BLOCKLIST_URL, { signal, redirect: "follow" });
-			if (!res.ok) {
-				console.error(`blocklist ${env.BLOCKLIST_URL}: HTTP ${res.status}`);
-			} else {
-				parseRuleSource(await res.text(), rules);
-			}
-		} catch (err) {
-			console.error(`blocklist fetch failed: ${err}`);
-		} finally {
-			clear();
-		}
+	addDomains(rules.blocked, env.BLOCK_DOMAINS);
+	addDomains(rules.allowed, env.ALLOW_DOMAINS);
+	const urls = (env.BLOCKLIST_URL ?? "").split(/[\s,]+/).filter(Boolean);
+	for (const list of await Promise.all(urls.map(fetchListRules))) {
+		for (const d of list.blocked) rules.blocked.add(d);
+		for (const d of list.allowed) rules.allowed.add(d);
+		for (const [d, ip] of list.hosts) rules.hosts.set(d, ip);
 	}
 	rules.updatedAt = Date.now();
 	return rules;
+}
+
+function addDomains(set: Set<string>, v: string | undefined): void {
+	if (!v) return;
+	for (const d of v.split(/[\s,]+/)) {
+		const dom = d.trim().toLowerCase().replace(/\.+$/, "");
+		if (dom) set.add(dom);
+	}
 }
 
 function timeout(ms: number): { signal: AbortSignal; clear: () => void } {
@@ -143,67 +163,84 @@ export async function getRules(env: Env): Promise<Rules> {
 
 /**
  * Env rules plus the per-request opts (union; env rules always stay as the
- * floor). `opts.list` blocklists are fetched and cached in isolate memory
+ * floor). `opts.list` filter URLs are fetched and cached in isolate memory
  * (never the edge cache — list content is third-party).
  */
 export async function getRulesFor(env: Env, opts: RequestOpts): Promise<Rules> {
 	const base = await getRules(env);
-	if (opts.block.length === 0 && opts.hosts.size === 0 && opts.list.length === 0) return base;
+	if (!hasFilter(opts)) return base;
 
 	const rules: Rules = {
 		blocked: new Set(base.blocked),
+		allowed: new Set(base.allowed),
 		hosts: new Map(base.hosts),
 		updatedAt: Date.now(),
 	};
-	for (const url of opts.list) {
-		for (const d of await fetchListRules(url)) rules.blocked.add(d);
+	for (const list of opts.list) {
+		const r = await fetchListRules(list);
+		for (const d of r.blocked) rules.blocked.add(d);
+		for (const d of r.allowed) rules.allowed.add(d);
+		for (const [d, ip] of r.hosts) rules.hosts.set(d, ip);
 	}
 	for (const d of opts.block) rules.blocked.add(d);
+	for (const d of opts.allow) rules.allowed.add(d);
 	for (const [d, ip] of opts.hosts) rules.hosts.set(d, ip);
 	return rules;
 }
 
-const LIST_TTL_MS = 10 * 60 * 1000;
-const listCache = new Map<string, { until: number; blocked: string[] }>();
-const listPending = new Map<string, Promise<string[]>>();
+function hasFilter(o: RequestOpts): boolean {
+	return o.block.length > 0 || o.allow.length > 0 || o.hosts.size > 0 || o.list.length > 0;
+}
 
-async function fetchListRules(url: string): Promise<string[]> {
+const LIST_TTL_MS = 10 * 60 * 1000;
+const listCache = new Map<string, { until: number; rules: Rules }>();
+const listPending = new Map<string, Promise<Rules>>();
+
+async function fetchListRules(url: string): Promise<Rules> {
 	const hit = listCache.get(url);
-	if (hit && Date.now() < hit.until) return hit.blocked;
+	if (hit && Date.now() < hit.until) return hit.rules;
 	let p = listPending.get(url);
 	if (!p) {
-		p = (async (): Promise<string[]> => {
+		p = (async (): Promise<Rules> => {
 			const { signal, clear } = timeout(FETCH_TIMEOUT_MS);
 			try {
 				const res = await fetch(url, { signal, redirect: "follow" });
 				if (!res.ok) {
 					console.error(`list ${url}: HTTP ${res.status}`);
-					return [];
+					return emptyRules();
 				}
 				// blocklists are huge by design; cap the text we ever parse
-				const text = (await res.text()).slice(0, 2_000_000);
 				const rules = emptyRules();
-				parseRuleSource(text, rules);
-				return [...rules.blocked];
+				parseRuleSource((await res.text()).slice(0, 2_000_000), rules);
+				return rules;
 			} catch (err) {
 				console.error(`list fetch failed: ${err}`);
-				return [];
+				return emptyRules();
 			} finally {
 				clear();
 			}
 		})().finally(() => listPending.delete(url));
 		listPending.set(url, p);
 	}
-	const blocked = await p.catch(() => [] as string[]);
-	listCache.set(url, { until: Date.now() + LIST_TTL_MS, blocked });
-	return blocked;
+	let rules: Rules;
+	try {
+		rules = await p;
+	} catch {
+		rules = emptyRules();
+	}
+	listCache.set(url, { until: Date.now() + LIST_TTL_MS, rules });
+	return rules;
 }
 
-/** Suffix match with label boundaries: "ads.x.com" hits "x.com" too. */
+/**
+ * Suffix match with label boundaries: "ads.x.com" hits "x.com" too.
+ * An allowlist hit at any level of the name overrides every block rule.
+ */
 export function isBlocked(rules: Rules, name: string): boolean {
 	if (rules.blocked.size === 0) return false;
 	let label = name.toLowerCase().replace(/\.+$/, "");
 	for (;;) {
+		if (rules.allowed.has(label)) return false;
 		if (rules.blocked.has(label)) return true;
 		const dot = label.indexOf(".");
 		if (dot === -1) return false;
@@ -213,6 +250,14 @@ export function isBlocked(rules: Rules, name: string): boolean {
 
 export function lookupHost(rules: Rules, name: string): string | null {
 	let label = name.toLowerCase().replace(/\.+$/, "");
+	// an exception anywhere up the tree disables the fixed answer for the name
+	for (;;) {
+		if (rules.allowed.has(label)) return null;
+		const dot = label.indexOf(".");
+		if (dot === -1) break;
+		label = label.slice(dot + 1);
+	}
+	label = name.toLowerCase().replace(/\.+$/, "");
 	for (;;) {
 		const ip = rules.hosts.get(label);
 		if (ip) return ip;

@@ -3,7 +3,9 @@ export interface Env {
 	UPSTREAM_DOH?: string;
 	/** Comma- or space-separated domains to block (NXDOMAIN). */
 	BLOCK_DOMAINS?: string;
-	/** Remote adblock/hosts blocklist fetched every 6h. */
+	/** Comma- or space-separated exception domains (never filtered). */
+	ALLOW_DOMAINS?: string;
+	/** Remote filter lists (adblock/hosts/dnsmasq), comma-separated, every 6h. */
 	BLOCKLIST_URL?: string;
 	/** Upstream race timeout per attempt, ms. Default 5000. */
 	UPSTREAM_TIMEOUT_MS?: string;

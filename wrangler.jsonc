@@ -14,9 +14,14 @@
 		// Domains to block (answered NXDOMAIN), comma/space separated.
 		"BLOCK_DOMAINS": "",
 
-		// Remote blocklist (adblock ||x^ / hosts / dnsmasq address= formats),
-		// refreshed every 6h. Example:
-		// "BLOCKLIST_URL": "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+		// Exception domains, never filtered; override block rules and hosts
+		// entries at any subdomain level. Comma/space separated.
+		"ALLOW_DOMAINS": "",
+
+		// Remote filter lists (adblock ||x^ / @@ exceptions / *.wildcards /
+		// hosts / dnsmasq address= formats), comma-separated multiple URLs,
+		// each refreshed every 6h. Example:
+		// "BLOCKLIST_URL": "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts,https://adguard-dns.io/filter.txt"
 		"BLOCKLIST_URL": ""
 	}
 }
