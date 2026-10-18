@@ -11,6 +11,14 @@
 		// keeps using the fastest responder.
 		"UPSTREAM_DOH": "https://cloudflare-dns.com/dns-query,https://dns.google/dns-query,https://dns.alidns.com/dns-query",
 
+		// Region-specific upstreams chosen from the client's Cloudflare cf
+		// metadata. "CODE=url[,url];CODE=url…" where CODE is an ISO country
+		// (JP, DE…) or continent (AF/AS/EU/NA/OC/SA) two-letter code.
+		// Order: request up= > country > continent > UPSTREAM_DOH.
+		// Example:
+		// "UPSTREAM_REGIONS": "JP=https://public.dns.iij.jp/dns-query;AS=https://dns.alidns.com/dns-query"
+		"UPSTREAM_REGIONS": "",
+
 		// Domains to block (answered NXDOMAIN), comma/space separated.
 		"BLOCK_DOMAINS": "",
 

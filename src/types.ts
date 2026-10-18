@@ -1,6 +1,12 @@
 export interface Env {
 	/** Comma-separated upstream DoH endpoints. Defaults to CF/Google/AliDNS. */
 	UPSTREAM_DOH?: string;
+	/**
+	 * Region overrides, "CODE=url[,url];CODE=url…" — CODE is an ISO country
+	 * (JP) or continent (AS/EU/…) two-letter code. Match order: per-request
+	 * up= > country > continent > UPSTREAM_DOH.
+	 */
+	UPSTREAM_REGIONS?: string;
 	/** Comma- or space-separated domains to block (NXDOMAIN). */
 	BLOCK_DOMAINS?: string;
 	/** Comma- or space-separated exception domains (never filtered). */

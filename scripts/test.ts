@@ -12,6 +12,7 @@ import {
 } from "../src/dnsmsg";
 import { isBlocked, lookupHost, parseRuleSource } from "../src/rules";
 import { canonicalOpts, hasOpts, optsHash, optsToParams, parseOpts } from "../src/opts";
+import { regionFor } from "../src/upstream";
 
 let passed = 0;
 async function ok(name: string, fn: () => void | Promise<void>): Promise<void> {
@@ -124,6 +125,7 @@ await ok("rules parse adblock/hosts/dnsmasq formats", () => {
 			"1.2.3.4 my.home",
 			"address=/x.com/9.9.9.9",
 			"address=/wrapped.info",
+			"9.9.9.9 gw.home # gateway",
 		].join("\n"),
 		rules,
 	);
@@ -134,6 +136,9 @@ await ok("rules parse adblock/hosts/dnsmasq formats", () => {
 	assert.equal(lookupHost(rules, "my.home"), "1.2.3.4");
 	assert.equal(lookupHost(rules, "x.com"), "9.9.9.9");
 	assert.equal(isBlocked(rules, "wrapped.info"), true);
+	assert.equal(lookupHost(rules, "gw.home"), "9.9.9.9");
+	assert.equal(rules.hosts.has("#"), false); // inline comment not parsed as a domain
+	assert.equal(rules.hosts.has("gateway"), false);
 });
 
 await ok("rules: AGH-style exceptions, wildcards, skipped syntax", () => {
@@ -219,6 +224,34 @@ await ok("opts canonical form and hash are order-insensitive", async () => {
 	const r = parseOpts(back);
 	assert.ok(r.ok);
 	assert.equal(canonicalOpts(r.opts), canonicalOpts(a.opts));
+});
+
+await ok("region: country > continent > global, up= wins, malformed skipped", () => {
+	const env = {
+		UPSTREAM_DOH: "https://global.example/dns-query",
+		UPSTREAM_REGIONS: "jp=https://jp1.example/dns-query,https://jp2.example/dns-query; AS = https://as1.example/dns-query ; malformed; X=",
+	};
+	const jp = regionFor(env, undefined, { country: "jp", continent: "AS" });
+	assert.deepEqual(jp.list, ["https://jp1.example/dns-query", "https://jp2.example/dns-query"]);
+	assert.equal(jp.bucket, "cJP");
+	// KR is not configured; its continent AS is
+	const as = regionFor(env, undefined, { country: "kr", continent: "AS" });
+	assert.deepEqual(as.list, ["https://as1.example/dns-query"]);
+	assert.equal(as.bucket, "kAS");
+	const miss = regionFor(env, undefined, { country: "de", continent: "EU" });
+	assert.deepEqual(miss.list, ["https://global.example/dns-query"]);
+	assert.equal(miss.bucket, "g");
+	assert.equal(regionFor(env, undefined, undefined).bucket, "g");
+	// feature off -> empty bucket, cacheKey stays as it was before regions
+	const off = regionFor({ UPSTREAM_DOH: "https://global.example/dns-query" }, undefined, { country: "JP" });
+	assert.equal(off.bucket, "");
+	assert.deepEqual(off.list, ["https://global.example/dns-query"]);
+	// up= param beats every region rule
+	const up = parseOpts(new URLSearchParams("up=https://dns.google/dns-query"));
+	assert.ok(up.ok);
+	const forced = regionFor(env, up.opts, { country: "jp" });
+	assert.deepEqual(forced.list, ["https://dns.google/dns-query"]);
+	assert.equal(forced.bucket, "");
 });
 
 console.log(`\n${passed} tests passed`);

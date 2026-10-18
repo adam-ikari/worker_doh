@@ -1,6 +1,6 @@
 import { buildReply, minAnswerTtl, parseQuestion, RCODE_NXDOMAIN, isStandardQuery, typeName } from "./dnsmsg";
 import { getRules, getRulesFor, isBlocked, lookupHost } from "./rules";
-import { resolveJson, resolveWire, UpstreamError } from "./upstream";
+import { resolveJson, resolveWire, regionFor, type RegionSel, UpstreamError } from "./upstream";
 import { hasOpts, optsHash, parseOpts, type RequestOpts } from "./opts";
 import { configPage } from "./page";
 import type { Env } from "./types";
@@ -38,11 +38,14 @@ export default {
 			return text(`bad config parameter — ${parsed.error}`, 400);
 		}
 		const opts: RequestOpts = parsed.opts;
+		const cf = req.cf as { country?: string; continent?: string } | undefined;
+		const region = regionFor(env, opts, cf);
+		const rtag = region.bucket ? `/r${region.bucket}` : "";
 
 		try {
 			// JSON API (debug/CORS): GET /?name=example.com&type=A
 			if (req.method === "GET" && sp.has("name")) {
-				return await handleJson(env, url, sp, opts);
+				return await handleJson(env, url, sp, opts, region);
 			}
 			if (req.method === "GET" && !sp.has("dns") && (url.pathname === "/" || url.pathname === "")) {
 				return configPage(url);
@@ -64,7 +67,7 @@ export default {
 			}
 			const hash = hasOpts(opts) ? `/${await optsHash(opts)}` : "";
 			const cacheKey = new Request(
-				`https://${url.host}/_doh_cache/${q.name}/t${q.type}${hash}`,
+				`https://${url.host}/_doh_cache/${q.name}/t${q.type}${rtag}${hash}`,
 				{ method: "GET" },
 			);
 
@@ -86,13 +89,14 @@ export default {
 			const cached = await cache.match(cacheKey);
 			if (cached) return cached;
 
-			// dedupe key carries the config hash: a plain query must never share
-			// an in-flight filtered result (or vice versa)
+			// dedupe keys carry region + config hash: a plain query must never
+			// share an in-flight filtered/other-region result (or vice versa)
 			const out = await resolveWire(
 				env,
 				query,
-				`${q.name}/${q.type}${hash}`,
+				`${q.name}/${q.type}${rtag}${hash}`,
 				hasOpts(opts) ? opts : undefined,
+				region,
 			);
 			const minTtl = minAnswerTtl(new Uint8Array(out.body));
 			const ttl = minTtl === null ? 0 : Math.min(minTtl, URL_TTL_CEILING);
@@ -198,7 +202,13 @@ async function cachePut(key: Request, res: Response): Promise<void> {
 	}
 }
 
-async function handleJson(env: Env, url: URL, sp: URLSearchParams, opts: RequestOpts): Promise<Response> {
+async function handleJson(
+	env: Env,
+	url: URL,
+	sp: URLSearchParams,
+	opts: RequestOpts,
+	region: RegionSel,
+): Promise<Response> {
 	const name = (sp.get("name") ?? "").toLowerCase().replace(/\.+$/, "");
 	if (!/^[a-z0-9._-]+$/.test(name)) return text("bad name", 400);
 	// forward only the DNS question — block/host/up/list are private config and
@@ -226,7 +236,7 @@ async function handleJson(env: Env, url: URL, sp: URLSearchParams, opts: Request
 		}
 	}
 
-	const out = await resolveJson(env, params, hasOpts(opts) ? opts : undefined);
+	const out = await resolveJson(env, params, region);
 	let body: Record<string, unknown>;
 	try {
 		body = JSON.parse(new TextDecoder().decode(out.body)) as Record<string, unknown>;

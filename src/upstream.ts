@@ -4,10 +4,11 @@
  *
  * Strategy:
  *  - cache miss -> race all upstreams concurrently, first valid response wins
- *  - the winner is remembered ("sticky") for STICKY_TTL_MS and tried alone
- *    first on subsequent queries, with a short timeout — falls back to a full
- *    race on timeout/failure. This keeps answers from flapping between
- *    resolvers' different CDN viewpoints while still recovering quickly.
+ *  - the winner is remembered ("sticky") per region bucket for STICKY_TTL_MS
+ *    and tried alone first on subsequent queries from that bucket, with a
+ *    short timeout — falls back to a full race on timeout/failure. This keeps
+ *    answers from flapping between resolvers' different CDN viewpoints while
+ *    still recovering quickly.
  *  - identical in-flight queries are deduped per isolate.
  */
 
@@ -29,14 +30,66 @@ const DEFAULT_UPSTREAMS = [
 	"https://dns.alidns.com/dns-query",
 ];
 
-function upstreamList(env: Env, opts?: RequestOpts): string[] {
-	if (opts && opts.up.length > 0) return opts.up; // validated by parseOpts
+/**
+ * Region-based upstream selection (deploy-time env only):
+ * `UPSTREAM_REGIONS="JP=https://a/dns-query,https://b/dns-query;AS=https://c/dns-query"`
+ * Match order: per-request `up=` > client country (cf.country) > client
+ * continent (cf.continent) > global UPSTREAM_DOH > built-in defaults.
+ * Two-letter codes are looked up as a country first, so e.g. "NA" serves both
+ * Namibia (country) and North America (continent fallback).
+ */
+export interface ClientRegion {
+	country?: string;
+	continent?: string;
+}
+
+export interface RegionSel {
+	list: string[];
+	/** cache/sticky partition tag: "" (feature off / custom up), "cXX", "kXX", "g" */
+	bucket: string;
+}
+
+function globalList(env: Env): string[] {
 	const list = (env.UPSTREAM_DOH ?? "")
 		.split(/[\s,]+/)
 		.map((s) => s.trim())
 		.filter(Boolean);
 	if (list.length === 0) list.push(...DEFAULT_UPSTREAMS);
 	return list;
+}
+
+let regionsMemo: { raw: string; map: Map<string, string[]> } | null = null;
+
+function parseRegions(raw: string): Map<string, string[]> {
+	if (regionsMemo && regionsMemo.raw === raw) return regionsMemo.map;
+	const map = new Map<string, string[]>();
+	for (const group of raw.split(";")) {
+		const eq = group.indexOf("=");
+		if (eq <= 0) continue;
+		const code = group.slice(0, eq).trim().toUpperCase();
+		const urls = group
+			.slice(eq + 1)
+			.split(",")
+			.map((s) => s.trim())
+			.filter(Boolean);
+		if (/^[A-Z]{2}$/.test(code) && urls.length > 0) map.set(code, urls);
+	}
+	regionsMemo = { raw, map };
+	return map;
+}
+
+export function regionFor(env: Env, opts?: RequestOpts, cf?: ClientRegion): RegionSel {
+	if (opts && opts.up.length > 0) return { list: opts.up, bucket: "" };
+	const raw = (env.UPSTREAM_REGIONS ?? "").trim();
+	if (raw) {
+		const map = parseRegions(raw);
+		const country = (cf?.country ?? "").toUpperCase();
+		const continent = (cf?.continent ?? "").toUpperCase();
+		if (country && map.has(country)) return { list: map.get(country)!, bucket: "c" + country };
+		if (continent && map.has(continent)) return { list: map.get(continent)!, bucket: "k" + continent };
+		return { list: globalList(env), bucket: "g" };
+	}
+	return { list: globalList(env), bucket: "" };
 }
 
 function timeout(ms: number): { signal: AbortSignal; clear: () => void } {
@@ -58,7 +111,8 @@ interface Sticky {
 	url: string;
 	until: number;
 }
-let sticky: Sticky | null = null;
+/** one sticky winner per region bucket — a CN winner must not serve JP clients */
+const sticky = new Map<string, Sticky>();
 
 const inflight = new Map<string, Promise<UpstreamResult>>();
 
@@ -117,11 +171,11 @@ function b64url(bytes: Uint8Array): string {
 async function raceWire(
 	env: Env,
 	query: Uint8Array,
-	opts?: RequestOpts,
+	sel: RegionSel,
+	customUp: boolean,
 ): Promise<UpstreamResult> {
 	const totalMs = numEnv(env.UPSTREAM_TIMEOUT_MS, FULL_TIMEOUT_MS_DEFAULT);
-	const stickyAllowed = !opts || opts.up.length === 0;
-	const attempts = upstreamList(env, opts).map(async (url) => {
+	const attempts = sel.list.map(async (url) => {
 		const viaPost = await fetchWire(url, query, totalMs, { method: "POST" });
 		if (viaPost) return viaPost;
 		// some RFC 8484 servers are GET-only in practice
@@ -130,8 +184,11 @@ async function raceWire(
 	const results = await Promise.allSettled(attempts);
 	for (const r of results) {
 		if (r.status === "fulfilled" && r.value) {
-			if (stickyAllowed) {
-				sticky = { url: r.value.upstream, until: Date.now() + numEnv(env.STICKY_TTL_MS, STICKY_TTL_MS_DEFAULT) };
+			if (!customUp) {
+				sticky.set(sel.bucket, {
+					url: r.value.upstream,
+					until: Date.now() + numEnv(env.STICKY_TTL_MS, STICKY_TTL_MS_DEFAULT),
+				});
 			}
 			return r.value;
 		}
@@ -140,14 +197,15 @@ async function raceWire(
 }
 
 /**
- * Resolve a wire-format query upstream. `key` is "<qname>/<qtype>" and used
- * to dedupe identical concurrent queries from this isolate.
+ * Resolve a wire-format query upstream. `key` is "<qname>/<qtype>/<region+opts
+ * tags>" and used to dedupe identical concurrent queries from this isolate.
  */
 export async function resolveWire(
 	env: Env,
 	query: Uint8Array,
 	key: string,
-	opts?: RequestOpts,
+	opts: RequestOpts | undefined,
+	sel: RegionSel,
 ): Promise<UpstreamResult> {
 	const customUp = !!opts && opts.up.length > 0;
 	const pending = inflight.get(key);
@@ -155,12 +213,13 @@ export async function resolveWire(
 
 	const p = (async (): Promise<UpstreamResult> => {
 		// a caller-supplied upstream list is used as-is, never via the sticky pick
-		if (!customUp && sticky && Date.now() < sticky.until) {
-			const fast = await fetchWire(sticky.url, query, STICKY_TIMEOUT_MS, { method: "POST" });
-			if (fast) return fast;
-			sticky = null; // current winner is slow down -> re-race
+		const fast = sticky.get(sel.bucket);
+		if (!customUp && fast && Date.now() < fast.until) {
+			const viaFast = await fetchWire(fast.url, query, STICKY_TIMEOUT_MS, { method: "POST" });
+			if (viaFast) return viaFast;
+			sticky.delete(sel.bucket); // current winner is slow down -> re-race
 		}
-		return raceWire(env, query, opts);
+		return raceWire(env, query, sel, customUp);
 	})().finally(() => inflight.delete(key));
 
 	inflight.set(key, p);
@@ -174,10 +233,10 @@ export async function resolveWire(
 export async function resolveJson(
 	env: Env,
 	params: URLSearchParams,
-	opts?: RequestOpts,
+	sel: RegionSel,
 ): Promise<UpstreamResult> {
 	const totalMs = numEnv(env.UPSTREAM_TIMEOUT_MS, FULL_TIMEOUT_MS_DEFAULT);
-	const attempts = upstreamList(env, opts).map(async (base) => {
+	const attempts = sel.list.map(async (base) => {
 		// Google-style servers expose the JSON API at /resolve, not /dns-query
 		const u = new URL(base);
 		if (/\/dns-query\/?$/.test(u.pathname)) u.pathname = "/resolve";

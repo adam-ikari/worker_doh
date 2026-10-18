@@ -4,7 +4,7 @@ title: "配置模型：无状态、每请求 URL 参数"
 category: decision
 status: active
 created: "2026-10-18T04:51:05"
-updated: "2026-10-18T05:58:07"
+updated: "2026-10-18T06:39:35"
 ---
 
 <!-- compiled_truth -->
@@ -53,4 +53,10 @@ DoH worker 的用户级配置完全无状态：配置编码在请求 URL 的 que
   kind: decision
   summary: "订阅过滤对齐 AGH：域名级语法子集（||dom^/*.dom/@@例外/hosts/address=，跳过正则与$修饰符与##），优先级不变量 allowed>hosts>blocked>上游，BLOCKLIST_URL 多源逗号分隔；dev 实测发现并修复 list→env 合并丢 hosts 的缺陷"
   source: "2026-10-18 订阅域名过滤（仿 AGH）实施 + dev 实测"
+  affects: [stateless-config-model]
+
+- time: 2026-10-18T06:39:35
+  kind: decision
+  summary: "地区上游选择=纯部署级 env（UPSTREAM_REGIONS \"码=URL;码=URL\"），刻意不进 URL 参数：地区由 Cloudflare 从客户端 IP 得出（cf.country/cf.continent），非用户配置；匹配优先级 up= > 国家码 > 大洲码 > UPSTREAM_DOH；两位码先按国家解析（NA 兼指纳米比亚与北美）。不变量：每个地区档（bucket cXX/kXX/g）独立 sticky 与边缘缓存分区，未配置时 bucket 为空、缓存 key 与旧版逐字节一致"
+  source: "2026-10-18 按地区上游选择实施"
   affects: [stateless-config-model]
