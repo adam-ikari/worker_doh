@@ -12,6 +12,7 @@
  */
 
 import type { Env } from "./types";
+import type { RequestOpts } from "./opts";
 
 export interface UpstreamResult {
 	status: number;
@@ -28,7 +29,8 @@ const DEFAULT_UPSTREAMS = [
 	"https://dns.alidns.com/dns-query",
 ];
 
-function upstreamList(env: Env): string[] {
+function upstreamList(env: Env, opts?: RequestOpts): string[] {
+	if (opts && opts.up.length > 0) return opts.up; // validated by parseOpts
 	const list = (env.UPSTREAM_DOH ?? "")
 		.split(/[\s,]+/)
 		.map((s) => s.trim())
@@ -115,9 +117,11 @@ function b64url(bytes: Uint8Array): string {
 async function raceWire(
 	env: Env,
 	query: Uint8Array,
+	opts?: RequestOpts,
 ): Promise<UpstreamResult> {
 	const totalMs = numEnv(env.UPSTREAM_TIMEOUT_MS, FULL_TIMEOUT_MS_DEFAULT);
-	const attempts = upstreamList(env).map(async (url) => {
+	const stickyAllowed = !opts || opts.up.length === 0;
+	const attempts = upstreamList(env, opts).map(async (url) => {
 		const viaPost = await fetchWire(url, query, totalMs, { method: "POST" });
 		if (viaPost) return viaPost;
 		// some RFC 8484 servers are GET-only in practice
@@ -126,7 +130,9 @@ async function raceWire(
 	const results = await Promise.allSettled(attempts);
 	for (const r of results) {
 		if (r.status === "fulfilled" && r.value) {
-			sticky = { url: r.value.upstream, until: Date.now() + numEnv(env.STICKY_TTL_MS, STICKY_TTL_MS_DEFAULT) };
+			if (stickyAllowed) {
+				sticky = { url: r.value.upstream, until: Date.now() + numEnv(env.STICKY_TTL_MS, STICKY_TTL_MS_DEFAULT) };
+			}
 			return r.value;
 		}
 	}
@@ -141,17 +147,20 @@ export async function resolveWire(
 	env: Env,
 	query: Uint8Array,
 	key: string,
+	opts?: RequestOpts,
 ): Promise<UpstreamResult> {
+	const customUp = !!opts && opts.up.length > 0;
 	const pending = inflight.get(key);
 	if (pending) return pending;
 
 	const p = (async (): Promise<UpstreamResult> => {
-		if (sticky && Date.now() < sticky.until) {
+		// a caller-supplied upstream list is used as-is, never via the sticky pick
+		if (!customUp && sticky && Date.now() < sticky.until) {
 			const fast = await fetchWire(sticky.url, query, STICKY_TIMEOUT_MS, { method: "POST" });
 			if (fast) return fast;
 			sticky = null; // current winner is slow down -> re-race
 		}
-		return raceWire(env, query);
+		return raceWire(env, query, opts);
 	})().finally(() => inflight.delete(key));
 
 	inflight.set(key, p);
@@ -165,9 +174,10 @@ export async function resolveWire(
 export async function resolveJson(
 	env: Env,
 	params: URLSearchParams,
+	opts?: RequestOpts,
 ): Promise<UpstreamResult> {
 	const totalMs = numEnv(env.UPSTREAM_TIMEOUT_MS, FULL_TIMEOUT_MS_DEFAULT);
-	const attempts = upstreamList(env).map(async (base) => {
+	const attempts = upstreamList(env, opts).map(async (base) => {
 		// Google-style servers expose the JSON API at /resolve, not /dns-query
 		const u = new URL(base);
 		if (/\/dns-query\/?$/.test(u.pathname)) u.pathname = "/resolve";

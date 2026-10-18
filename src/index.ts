@@ -1,6 +1,8 @@
 import { buildReply, minAnswerTtl, parseQuestion, RCODE_NXDOMAIN, isStandardQuery, typeName } from "./dnsmsg";
-import { getRules, isBlocked, lookupHost } from "./rules";
+import { getRules, getRulesFor, isBlocked, lookupHost } from "./rules";
 import { resolveJson, resolveWire, UpstreamError } from "./upstream";
+import { hasOpts, optsHash, parseOpts, type RequestOpts } from "./opts";
+import { configPage } from "./page";
 import type { Env } from "./types";
 
 const CT_WIRE = "application/dns-message";
@@ -28,16 +30,25 @@ export default {
 		const url = new URL(req.url);
 		const cache = (caches as unknown as { default: Cache }).default;
 
+		// /p/<b64url> carries "?block=..." (and optionally the wire query) in the path
+		const path = decodePath(url.pathname);
+		const sp = path ? path.sp : url.searchParams;
+		const parsed = parseOpts(sp);
+		if (!parsed.ok) {
+			return text(`bad config parameter — ${parsed.error}`, 400);
+		}
+		const opts: RequestOpts = parsed.opts;
+
 		try {
 			// JSON API (debug/CORS): GET /?name=example.com&type=A
-			if (req.method === "GET" && !url.searchParams.has("dns") && url.searchParams.has("name")) {
-				return await handleJson(env, url);
+			if (req.method === "GET" && sp.has("name")) {
+				return await handleJson(env, url, sp, opts);
 			}
-			if (req.method === "GET" && !url.searchParams.has("dns") && (url.pathname === "/" || url.pathname === "")) {
-				return landing(url);
+			if (req.method === "GET" && !sp.has("dns") && (url.pathname === "/" || url.pathname === "")) {
+				return configPage(url);
 			}
 
-			const query = await readQuery(req, url);
+			const query = await readQuery(req, url, path);
 			if (!query) {
 				return text(
 					"expected a DNS question: GET ?dns=<base64url> or POST application/dns-message",
@@ -51,13 +62,16 @@ export default {
 			if (!q || query.byteLength > MAX_QUERY_BYTES) {
 				return text("unsupported DNS query", 400);
 			}
+			const hash = hasOpts(opts) ? `/${await optsHash(opts)}` : "";
 			const cacheKey = new Request(
-				`https://${url.host}/_doh_cache/${q.name}/t${q.type}`,
+				`https://${url.host}/_doh_cache/${q.name}/t${q.type}${hash}`,
 				{ method: "GET" },
 			);
 
 			// ---- custom rules (always authoritative, but edge-cacheable briefly) ----
-			const rules = await getRules(env);
+			const rules = hasOpts(opts)
+				? await getRulesFor(env, opts)
+				: await getRules(env);
 			if (isBlocked(rules, q.name)) {
 				return wireReply(ctx, cacheKey, buildReply(query, { rcode: RCODE_NXDOMAIN }), BLOCK_TTL);
 			}
@@ -72,7 +86,14 @@ export default {
 			const cached = await cache.match(cacheKey);
 			if (cached) return cached;
 
-			const out = await resolveWire(env, query, `${q.name}/${q.type}`);
+			// dedupe key carries the config hash: a plain query must never share
+			// an in-flight filtered result (or vice versa)
+			const out = await resolveWire(
+				env,
+				query,
+				`${q.name}/${q.type}${hash}`,
+				hasOpts(opts) ? opts : undefined,
+			);
 			const minTtl = minAnswerTtl(new Uint8Array(out.body));
 			const ttl = minTtl === null ? 0 : Math.min(minTtl, URL_TTL_CEILING);
 
@@ -87,7 +108,40 @@ export default {
 	},
 } satisfies ExportedHandler<Env>;
 
-async function readQuery(req: Request, url: URL): Promise<Uint8Array | null> {
+interface PathInfo {
+	/** config query params carried in the path ("" → empty) */
+	sp: URLSearchParams;
+	/** wire query bytes carried in the path, if any */
+	query: Uint8Array | null;
+}
+
+/**
+ * Decode `/p/<b64url>`. The payload is either "?<config>" (config only; query
+ * comes from ?dns= or the POST body), or "<b64wire>|<config>" with the wire
+ * DNS query first ("|" separator — "?" and "&" are eaten by the URL layer).
+ */
+function decodePath(pathname: string): PathInfo | null {
+	if (!pathname.startsWith("/p/")) return null;
+	const rest = decodeURIComponent(pathname.slice(3));
+	const seg = b64urlDecode(rest);
+	if (!seg) return null;
+	const text = new TextDecoder().decode(seg);
+	const bar = text.indexOf("|");
+	if (bar > 0) {
+		const wire = b64urlDecode(text.slice(0, bar));
+		let cfg = text.slice(bar + 1);
+		if (cfg.startsWith("?")) cfg = cfg.slice(1);
+		return { sp: new URLSearchParams(cfg), query: wire };
+	}
+	return { sp: new URLSearchParams(text.startsWith("?") ? text.slice(1) : text), query: null };
+}
+
+async function readQuery(
+	req: Request,
+	url: URL,
+	path: PathInfo | null,
+): Promise<Uint8Array | null> {
+	if (path?.query) return path.query;
 	if (req.method === "POST") {
 		const ct = req.headers.get("content-type") ?? "";
 		if (!ct.includes(CT_WIRE)) return null;
@@ -144,14 +198,20 @@ async function cachePut(key: Request, res: Response): Promise<void> {
 	}
 }
 
-async function handleJson(env: Env, url: URL): Promise<Response> {
-	const name = (url.searchParams.get("name") ?? "").toLowerCase().replace(/\.+$/, "");
+async function handleJson(env: Env, url: URL, sp: URLSearchParams, opts: RequestOpts): Promise<Response> {
+	const name = (sp.get("name") ?? "").toLowerCase().replace(/\.+$/, "");
 	if (!/^[a-z0-9._-]+$/.test(name)) return text("bad name", 400);
-	const params = new URLSearchParams(url.searchParams);
+	// forward only the DNS question — block/host/up/list are private config and
+	// must not leak to third-party upstreams
+	const params = new URLSearchParams();
+	for (const k of ["type", "do", "edns_client_subnet"]) {
+		const v = sp.get(k);
+		if (v !== null) params.set(k, v);
+	}
 	params.set("name", name);
 	const typeStr = typeNameOf(params);
 
-	const rules = await getRules(env);
+	const rules = hasOpts(opts) ? await getRulesFor(env, opts) : await getRules(env);
 	if (isBlocked(rules, name)) {
 		return jsonResponse({ Status: RCODE_NXDOMAIN, Question: [{ name, type: typeStr }] });
 	}
@@ -166,7 +226,7 @@ async function handleJson(env: Env, url: URL): Promise<Response> {
 		}
 	}
 
-	const out = await resolveJson(env, params);
+	const out = await resolveJson(env, params, hasOpts(opts) ? opts : undefined);
 	let body: Record<string, unknown>;
 	try {
 		body = JSON.parse(new TextDecoder().decode(out.body)) as Record<string, unknown>;
@@ -205,23 +265,6 @@ function jsonResponse(obj: Record<string, unknown>): Response {
 			...CORS,
 		}),
 	});
-}
-
-function landing(url: URL): Response {
-	const host = url.host;
-	const html = `<!doctype html><meta charset=utf-8><title>DoH relay</title>
-<body style="font-family:system-ui;max-width:46rem;margin:3rem auto;line-height:1.6">
-<h1>DNS-over-HTTPS relay</h1>
-<p>RFC 8484 DoH endpoint with edge caching, fastest-upstream auto selection and custom block/hosts rules.</p>
-<ul>
-<li><b>Wire format:</b> <code>GET https://${host}/dns-query?dns=&lt;base64url&gt;</code> or
-<code>POST https://${host}/dns-query</code> (Content-Type: application/dns-message)</li>
-<li><b>JSON (debug):</b> <code>GET https://${host}/?name=example.com&amp;type=A</code></li>
-</ul>
-<p>Point clients at <code>https://${host}/dns-query</code> — e.g. browser secure DNS, or
-<code>dig @${host}</code> with <code>+https</code> via <code>--doh-url</code>.</p>
-</body>`;
-	return new Response(html, { headers: { "content-type": "text/html;charset=UTF-8", ...CORS } });
 }
 
 function text(msg: string, status: number): Response {

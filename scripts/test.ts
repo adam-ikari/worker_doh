@@ -11,10 +11,11 @@ import {
 	RCODE_NXDOMAIN,
 } from "../src/dnsmsg";
 import { isBlocked, lookupHost, parseRuleSource } from "../src/rules";
+import { canonicalOpts, optsHash, optsToParams, parseOpts } from "../src/opts";
 
 let passed = 0;
-function ok(name: string, fn: () => void): void {
-	fn();
+async function ok(name: string, fn: () => void | Promise<void>): Promise<void> {
+	await fn();
 	passed++;
 	console.log(`  ok - ${name}`);
 }
@@ -38,7 +39,7 @@ function queryWire(name: string, type = 1, id = 0x1234): Uint8Array {
 	return buf;
 }
 
-ok("parseQuestion walks labels and returns correct end offset", () => {
+await ok("parseQuestion walks labels and returns correct end offset", () => {
 	const q = parseQuestion(queryWire("example.com"))!;
 	assert.ok(q);
 	assert.equal(q.name, "example.com");
@@ -47,21 +48,21 @@ ok("parseQuestion walks labels and returns correct end offset", () => {
 	assert.equal(q.end, 29);
 });
 
-ok("parseQuestion handles root query", () => {
+await ok("parseQuestion handles root query", () => {
 	const q = parseQuestion(queryWire("", 1))!;
 	assert.ok(q);
 	assert.equal(q.name, "");
 	assert.equal(q.end, 17);
 });
 
-ok("isStandardQuery rejects responses and non-zero opcodes", () => {
+await ok("isStandardQuery rejects responses and non-zero opcodes", () => {
 	assert.ok(isStandardQuery(queryWire("a.com")));
 	const resp = queryWire("a.com");
 	resp[2] |= 0x80;
 	assert.ok(!isStandardQuery(resp));
 });
 
-ok("buildReply NXDOMAIN keeps question and clears answer count", () => {
+await ok("buildReply NXDOMAIN keeps question and clears answer count", () => {
 	const query = queryWire("ads.example.com");
 	const reply = buildReply(query, { rcode: RCODE_NXDOMAIN });
 	assert.equal(reply.length, 33);
@@ -74,7 +75,7 @@ ok("buildReply NXDOMAIN keeps question and clears answer count", () => {
 	);
 });
 
-ok("buildReply A answer emits pointer + A record and keeps EDNS", () => {
+await ok("buildReply A answer emits pointer + A record and keeps EDNS", () => {
 	const query = queryWire("my.home"); // q.end = 25
 	// fabricate an OPT record in the additional section: root name, type 41
 	const withOpt = new Uint8Array(query.length);
@@ -98,7 +99,7 @@ ok("buildReply A answer emits pointer + A record and keeps EDNS", () => {
 	assert.deepEqual(Array.from(reply.subarray(41)), Array.from(opt));
 });
 
-ok("minAnswerTtl scans answers with compressed names", () => {
+await ok("minAnswerTtl scans answers with compressed names", () => {
 	// build a fake response: header + question + A answer (compressed name) + TTL 60
 	const query = queryWire("example.com");
 	const msg = new Uint8Array(query.length + 16);
@@ -112,7 +113,7 @@ ok("minAnswerTtl scans answers with compressed names", () => {
 	assert.equal(minAnswerTtl(query), null); // a query has no answers
 });
 
-ok("rules parse adblock/hosts/dnsmasq formats", () => {
+await ok("rules parse adblock/hosts/dnsmasq formats", () => {
 	const rules = { blocked: new Set<string>(), hosts: new Map<string, string>(), updatedAt: 0 };
 	parseRuleSource(
 		[
@@ -133,6 +134,47 @@ ok("rules parse adblock/hosts/dnsmasq formats", () => {
 	assert.equal(lookupHost(rules, "my.home"), "1.2.3.4");
 	assert.equal(lookupHost(rules, "x.com"), "9.9.9.9");
 	assert.equal(isBlocked(rules, "wrapped.info"), true);
+});
+
+await ok("opts parse, validate, and reject SSRF-ish urls", () => {
+	const r = parseOpts(
+		new URLSearchParams("block=Ads.Example.com,tracker.net&host=my.home/1.2.3.4&up=https://dns.google/dns-query"),
+	);
+	assert.ok(r.ok);
+	assert.deepEqual(r.opts.block, ["ads.example.com", "tracker.net"]);
+	assert.equal(r.opts.hosts.get("my.home"), "1.2.3.4");
+	assert.deepEqual(r.opts.up, ["https://dns.google/dns-query"]);
+
+	// rejects: non-https, IP literal, localhost/private TLD, query injection, bad host entry
+	for (const qs of [
+		"up=http://dns.google/dns-query",
+		"up=https://1.1.1.1/dns-query",
+		"up=https://localhost/dns-query",
+		"up=https://box.internal/dns-query",
+		"up=https://evil.com/x?a=",
+		"list=https://169.254.169.254/latest/meta-data",
+		"host=my.home",
+		"host=my.home/999.1.1.1",
+		"block=bad domain",
+	]) {
+		assert.ok(!parseOpts(new URLSearchParams(qs)).ok, `should reject: ${qs}`);
+	}
+});
+
+await ok("opts canonical form and hash are order-insensitive", async () => {
+	const a = parseOpts(new URLSearchParams("block=x.com,y.com&host=b.lan/2.2.2.2,a.lan/1.1.1.1"));
+	const b = parseOpts(new URLSearchParams("block=y.com,x.com&host=a.lan/1.1.1.1,b.lan/2.2.2.2"));
+	assert.ok(a.ok && b.ok);
+	assert.equal(canonicalOpts(a.opts), canonicalOpts(b.opts));
+	assert.equal(await optsHash(a.opts), await optsHash(b.opts));
+	const c = parseOpts(new URLSearchParams("block=x.com,y.com.z"));
+	assert.ok(c.ok);
+	assert.notEqual(await optsHash(c.opts), await optsHash(a.opts));
+
+	const back = optsToParams(a.opts);
+	const r = parseOpts(back);
+	assert.ok(r.ok);
+	assert.equal(canonicalOpts(r.opts), canonicalOpts(a.opts));
 });
 
 console.log(`\n${passed} tests passed`);

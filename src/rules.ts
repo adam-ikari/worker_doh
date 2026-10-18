@@ -16,6 +16,7 @@
  */
 
 import type { Env } from "./types";
+import type { RequestOpts } from "./opts";
 
 export interface Rules {
 	blocked: Set<string>;
@@ -138,6 +139,64 @@ export async function getRules(env: Env): Promise<Rules> {
 		}
 	}
 	return rulesPending ?? rulesState?.rules ?? emptyRules();
+}
+
+/**
+ * Env rules plus the per-request opts (union; env rules always stay as the
+ * floor). `opts.list` blocklists are fetched and cached in isolate memory
+ * (never the edge cache — list content is third-party).
+ */
+export async function getRulesFor(env: Env, opts: RequestOpts): Promise<Rules> {
+	const base = await getRules(env);
+	if (opts.block.length === 0 && opts.hosts.size === 0 && opts.list.length === 0) return base;
+
+	const rules: Rules = {
+		blocked: new Set(base.blocked),
+		hosts: new Map(base.hosts),
+		updatedAt: Date.now(),
+	};
+	for (const url of opts.list) {
+		for (const d of await fetchListRules(url)) rules.blocked.add(d);
+	}
+	for (const d of opts.block) rules.blocked.add(d);
+	for (const [d, ip] of opts.hosts) rules.hosts.set(d, ip);
+	return rules;
+}
+
+const LIST_TTL_MS = 10 * 60 * 1000;
+const listCache = new Map<string, { until: number; blocked: string[] }>();
+const listPending = new Map<string, Promise<string[]>>();
+
+async function fetchListRules(url: string): Promise<string[]> {
+	const hit = listCache.get(url);
+	if (hit && Date.now() < hit.until) return hit.blocked;
+	let p = listPending.get(url);
+	if (!p) {
+		p = (async (): Promise<string[]> => {
+			const { signal, clear } = timeout(FETCH_TIMEOUT_MS);
+			try {
+				const res = await fetch(url, { signal, redirect: "follow" });
+				if (!res.ok) {
+					console.error(`list ${url}: HTTP ${res.status}`);
+					return [];
+				}
+				// blocklists are huge by design; cap the text we ever parse
+				const text = (await res.text()).slice(0, 2_000_000);
+				const rules = emptyRules();
+				parseRuleSource(text, rules);
+				return [...rules.blocked];
+			} catch (err) {
+				console.error(`list fetch failed: ${err}`);
+				return [];
+			} finally {
+				clear();
+			}
+		})().finally(() => listPending.delete(url));
+		listPending.set(url, p);
+	}
+	const blocked = await p.catch(() => [] as string[]);
+	listCache.set(url, { until: Date.now() + LIST_TTL_MS, blocked });
+	return blocked;
 }
 
 /** Suffix match with label boundaries: "ads.x.com" hits "x.com" too. */
