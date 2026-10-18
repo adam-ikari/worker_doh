@@ -1,0 +1,22 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "worker-doh",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-10-01",
+	"observability": {
+		"enabled": true
+	},
+	"vars": {
+		// Comma-separated upstream DoH endpoints. The worker races them and
+		// keeps using the fastest responder.
+		"UPSTREAM_DOH": "https://cloudflare-dns.com/dns-query,https://dns.google/dns-query,https://dns.alidns.com/dns-query",
+
+		// Domains to block (answered NXDOMAIN), comma/space separated.
+		"BLOCK_DOMAINS": "",
+
+		// Remote blocklist (adblock ||x^ / hosts / dnsmasq address= formats),
+		// refreshed every 6h. Example:
+		// "BLOCKLIST_URL": "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+		"BLOCKLIST_URL": ""
+	}
+}
