@@ -13,6 +13,7 @@ import {
 import { isBlocked, lookupHost, parseRuleSource } from "../src/rules";
 import { canonicalOpts, hasOpts, optsHash, optsToParams, parseOpts } from "../src/opts";
 import { regionFor } from "../src/upstream";
+import { configPage } from "../src/page";
 
 let passed = 0;
 async function ok(name: string, fn: () => void | Promise<void>): Promise<void> {
@@ -252,6 +253,18 @@ await ok("region: country > continent > global, up= wins, malformed skipped", ()
 	const forced = regionFor(env, up.opts, { country: "jp" });
 	assert.deepEqual(forced.list, ["https://dns.google/dns-query"]);
 	assert.equal(forced.bucket, "");
+});
+
+await ok("page: dual theme + rules editor anchors, inline JS parses", async () => {
+	const page = configPage(new URL("https://doh.example.com/dns-query"));
+	const html = await page.text();
+	assert.ok(html.includes("@media (prefers-color-scheme: dark)"));
+	assert.ok(html.includes('id="rules"'));
+	assert.ok(html.includes("doh-ui-theme"));
+	const m = html.match(/<script>([\s\S]*)<\/script>/);
+	assert.ok(m && m[1].length > 1000);
+	new Function(m[1]); // throws SyntaxError on broken inline JS
+	assert.ok(html.includes("doh.example.com"));
 });
 
 console.log(`\n${passed} tests passed`);

@@ -4,7 +4,7 @@ title: "配置模型：无状态、每请求 URL 参数"
 category: decision
 status: active
 created: "2026-10-18T04:51:05"
-updated: "2026-10-18T06:39:35"
+updated: "2026-10-18T16:01:02"
 ---
 
 <!-- compiled_truth -->
@@ -60,3 +60,9 @@ DoH worker 的用户级配置完全无状态：配置编码在请求 URL 的 que
   summary: "地区上游选择=纯部署级 env（UPSTREAM_REGIONS \"码=URL;码=URL\"），刻意不进 URL 参数：地区由 Cloudflare 从客户端 IP 得出（cf.country/cf.continent），非用户配置；匹配优先级 up= > 国家码 > 大洲码 > UPSTREAM_DOH；两位码先按国家解析（NA 兼指纳米比亚与北美）。不变量：每个地区档（bucket cXX/kXX/g）独立 sticky 与边缘缓存分区，未配置时 bucket 为空、缓存 key 与旧版逐字节一致"
   source: "2026-10-18 按地区上游选择实施"
   affects: [stateless-config-model]
+
+- time: 2026-10-18T16:01:02
+  kind: decision
+  summary: "配置页 UI 重设计为「DoH 控制台」：双主题（prefers-color-scheme + 三态手动切换）、高级规则编辑器（AGH 语法在浏览器端映射为 block/allow/host 参数，服务端零改动、语义不变）、在线测试面板渲染 rcode 徽章/记录表格、平台接入片段 tabs。规则编辑器仅是客户端参数生成器，服务端仍不认识 AGH 原文。"
+  source: "src/page.ts 重写 + scripts/test.ts 内联 JS 语法校验"
+  affects: [src/page.ts]
