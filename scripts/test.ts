@@ -9,6 +9,10 @@ import {
 	minAnswerTtl,
 	parseQuestion,
 	RCODE_NXDOMAIN,
+	scrubQuery,
+	randomId,
+	setMsgId,
+	coarseEcsParam,
 } from "../src/dnsmsg";
 import { isBlocked, lookupHost, parseRuleSource } from "../src/rules";
 import { canonicalOpts, hasOpts, optsHash, optsToParams, parseOpts } from "../src/opts";
@@ -265,6 +269,99 @@ await ok("page: dual theme + rules editor anchors, inline JS parses", async () =
 	assert.ok(m && m[1].length > 1000);
 	new Function(m[1]); // throws SyntaxError on broken inline JS
 	assert.ok(html.includes("doh.example.com"));
+});
+
+function optWith(options: number[][]): number[] {
+	// root name, type 41, class=udp size, ext-ver + flags(CD), RDLENGTH, options
+	const rdlen = options.reduce((n, o) => n + o.length, 0);
+	const rr = [0, 0, 41, 0x25, 0x00, 0, 0x80, 0, 0, rdlen >> 8, rdlen & 0xff];
+	for (const o of options) rr.push(...o);
+	return rr;
+}
+
+function queryWithOpt(options: number[][], name = "example.com"): Uint8Array {
+	const q = queryWire(name);
+	const rr = optWith(options);
+	const msg = new Uint8Array(q.length + rr.length);
+	msg.set(q);
+	msg.set(rr, q.length);
+	new DataView(msg.buffer).setUint16(10, 1); // ARCOUNT
+	return msg;
+}
+
+function walkOptions(opt: Uint8Array): Array<{ code: number; data: Uint8Array }> {
+	const out: Array<{ code: number; data: Uint8Array }> = [];
+	let o = 11; // past OPT fixed part (name+type+class+ttl+rdlength)
+	while (o + 4 <= opt.length) {
+		const code = (opt[o] << 8) | opt[o + 1];
+		const len = (opt[o + 2] << 8) | opt[o + 3];
+		out.push({ code, data: opt.subarray(o + 4, o + 4 + len) });
+		o += 4 + len;
+	}
+	return out;
+}
+
+await ok("scrubQuery coarsens ECS and drops cookies/padding, keeps other options", () => {
+	const qLen = queryWire("example.com").length;
+	const ecsData = [0, 1, 24, 0, 1, 2, 3, 4]; // v4 1.2.3.4/24
+	const msg = queryWithOpt([
+		[0, 10, 0, 4, 0xaa, 0xbb, 0xcc, 0xdd], // CLIENT_COOKIE — dropped
+		[0, 8, 0, ecsData.length, ...ecsData], // ECS
+		[0, 12, 0, 2, 0, 0], // PADDING — dropped
+		[0, 99, 0, 1, 0x7f], // unknown — kept
+	]);
+	const scrubbed = scrubQuery(msg);
+	const rr = scrubbed.subarray(qLen);
+	const opts = walkOptions(rr);
+	assert.deepEqual(opts.map((o) => o.code), [8, 99]);
+	const e = opts[0].data;
+	assert.equal(e[1], 1); // family v4
+	assert.equal(e[2], 8); // prefix truncated to /8
+	assert.deepEqual(Array.from(e.subarray(4)), [1]); // /8 → 1 address byte, region kept
+	assert.deepEqual(Array.from(opts[1].data), [0x7f]);
+	assert.equal(new DataView(scrubbed.buffer).getUint16(10), 1); // ARCOUNT unchanged
+	assert.equal(rr[6] & 0x80, 0x80); // CD flag preserved
+	// question section untouched, ID untouched
+	assert.deepEqual(Array.from(scrubbed.subarray(0, qLen)), Array.from(msg.subarray(0, qLen)));
+});
+
+await ok("scrubQuery: coarse ECS kept, v6 truncated, no-OPT and malformed-OPT cases", () => {
+	const already = queryWithOpt([[0, 8, 0, 5, 0, 1, 8, 0, 9]]); // 9.0.0.0/8 (data: fam,src=/8,scope=0,addr 9)
+	assert.equal(scrubQuery(already), already); // nothing to change → same reference
+	const v6 = queryWithOpt([[0, 8, 0, 12, 0, 2, 64, 0, 0x20, 0x01, 0x0d, 0xb8, 0x12, 0x34, 0, 0]]); // 2001:db8:1234::/64
+	const s6 = scrubQuery(v6);
+	const o6 = walkOptions(s6.subarray(queryWire("example.com").length))[0];
+	assert.equal(o6.data[1], 2);
+	assert.equal(o6.data[2], 32);
+	assert.deepEqual(Array.from(o6.data.subarray(4)), [0x20, 0x01, 0x0d, 0xb8]);
+	const plain = queryWire("a.com");
+	assert.equal(scrubQuery(plain), plain);
+	// truncated option (len runs past RDATA) → whole OPT dropped
+	const broken = queryWithOpt([[0, 8, 0, 20, 0, 1]]);
+	const out = scrubQuery(broken);
+	assert.equal(out.length, queryWire("example.com").length);
+	assert.equal(new DataView(out.buffer).getUint16(10), 0);
+});
+
+await ok("randomId + setMsgId round-trip", () => {
+	const q = queryWire("a.com", 1, 0xbeef);
+	const r = randomId(q);
+	assert.equal(r.id, 0xbeef);
+	const rid = (r.msg[0] << 8) | r.msg[1];
+	assert.notEqual(rid, 0xbeef); // overwhelmingly likely
+	const back = setMsgId(r.msg, r.id);
+	assert.equal((back[0] << 8) | back[1], 0xbeef);
+	assert.equal((q[0] << 8) | q[1], 0xbeef); // inputs not mutated
+});
+
+await ok("coarseEcsParam truncates to region prefixes", () => {
+	assert.equal(coarseEcsParam("1.2.3.4"), "1.0.0.0/8");
+	assert.equal(coarseEcsParam("1.2.3.4/24"), "1.0.0.0/8");
+	assert.equal(coarseEcsParam("1.2.3.4/4"), "1.0.0.0/4"); // already coarser → kept
+	assert.equal(coarseEcsParam("2001:db8:1234::/48"), "2001:db8:0:0:0:0:0:0/32");
+	assert.equal(coarseEcsParam("2001:db8::/32"), "2001:db8:0:0:0:0:0:0/32");
+	assert.equal(coarseEcsParam("not-an-ip"), null);
+	assert.equal(coarseEcsParam("1.2.3.4/99"), null);
 });
 
 console.log(`\n${passed} tests passed`);

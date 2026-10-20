@@ -140,6 +140,7 @@ summary{cursor:pointer;font-weight:600;color:var(--ink)}
 <tr><td><code>up</code></td><td>本次请求的上游 DoH 列表（https、≤8），覆盖服务器默认与地区规则</td></tr>
 <tr><td><code>list</code></td><td>远程过滤器订阅 URL（≤4），语法见下，结果缓存 10 分钟</td></tr>
 <tr><td><em>高级规则</em></td><td>仅本页生效的输入助手：逐行解析后并入 block/allow/host 参数，服务端没有对应的新语义</td></tr>
+<tr><td><em>隐私（常开）</em></td><td>查询出网前自动处理：ECS 前缀粗化到 /8（v4）或 /32（v6，区域保留、精度移除）、剥离 Client Cookie/Padding/Client Tag、查询 ID 随机化（应答时还原为你的 ID）</td></tr>
 </table>
 <p>过滤器订阅 / 高级规则支持的语法（域名级子集，仿 AdGuard Home）：
 <code>||域^</code> 拦截、<code>*.域</code> 通配、<code>@@||域^</code> 例外、hosts 文件

@@ -235,3 +235,222 @@ function scanSections(
 	if (!walk(arcount)) return null;
 	return { extraStart };
 }
+
+// ---- client-identity scrubbing for outbound queries ----
+
+const ECS_CAP_V4 = 8; // keep the client's /8 (region), drop everything finer
+const ECS_CAP_V6 = 32;
+/** EDNS options that carry client identity or enable tracking/fingerprinting */
+const DROP_OPTIONS = new Set([10, 11, 12, 15]); // CLIENT/SERVER_COOKIE, PADDING, CLIENT-TAG
+
+/** Coarsen one ECS option's data (RFC 7871): truncate prefix, zero low bits. */
+function coarseEcsData(data: Uint8Array): Uint8Array | null {
+	if (data.length < 4) return null;
+	const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+	const family = dv.getUint16(0);
+	const prefix = data[2];
+	const addr = data.subarray(4);
+	const cap = family === 1 ? ECS_CAP_V4 : family === 2 ? ECS_CAP_V6 : -1;
+	if (cap < 0 || prefix > (family === 1 ? 32 : 128)) return null;
+	if (prefix <= cap) return data.slice(); // already coarse enough
+	const newPrefix = cap;
+	const keepBytes = Math.ceil(newPrefix / 8);
+	const out = new Uint8Array(4 + keepBytes);
+	out[0] = data[0];
+	out[1] = data[1];
+	out[2] = newPrefix;
+	// out[3] stays 0 (family-independent prefix in RFC 7871 layout: octets covered by full bytes are kept, remainder zeroed)
+	out.set(addr.subarray(0, Math.min(keepBytes, addr.length)), 4);
+	return out;
+}
+
+/**
+ * Strip client-identifying EDNS options from a query before forwarding:
+ * ECS (option 8) is coarsened to the client's /8 (v4) or /32 (v6) region,
+ * cookies/padding/client-tag are removed, remaining options and the OPT
+ * flags (DNSSEC CD bit) survive. A malformed OPT is dropped whole
+ * (fail-closed). The question section is never touched, so answer-section
+ * compression pointers into it stay valid.
+ */
+export function scrubQuery(msg: Uint8Array): Uint8Array {
+	const q = parseQuestion(msg);
+	if (!q) return msg;
+	const arcount = (msg[10] << 8) | msg[11];
+	if (arcount === 0) return msg;
+	const scanned = scanSections(msg, q.end);
+	// unparseable sections beyond the question: drop everything after it
+	if (!scanned) return dropAllOpt(msg, q, q.end);
+	if (scanned.extraStart === null) return msg;
+	const extraStart = scanned.extraStart;
+
+	const out: number[] = [];
+	let off = extraStart;
+	let droppedRrs = 0;
+	for (let i = 0; i < arcount; i++) {
+		const rrStart = off;
+		// owner name
+		for (;;) {
+			if (off >= msg.length) return dropAllOpt(msg, q, extraStart);
+			const len = msg[off];
+			if ((len & 0xc0) === 0xc0) {
+				off += 2;
+				break;
+			}
+			if (len === 0) {
+				off += 1;
+				break;
+			}
+			off += 1 + len;
+		}
+		if (msg.length - off < 10) return dropAllOpt(msg, q, extraStart);
+		const type = (msg[off] << 8) | msg[off + 1];
+		const rdlength = (msg[off + 8] << 8) | msg[off + 9];
+		const rdataStart = off + 10;
+		const rrEnd = rdataStart + rdlength;
+		if (rrEnd > msg.length) return dropAllOpt(msg, q, extraStart);
+		if (type !== 41) {
+			out.push(...msg.subarray(rrStart, rrEnd));
+			off = rrEnd;
+			continue;
+		}
+		// OPT: rebuild the option list from RDATA
+		const fixed = Array.from(msg.subarray(rrStart, rdataStart)); // name+type+class+ttl
+		const opts = msg.subarray(rdataStart, rrEnd);
+		const rebuilt: number[] = [];
+		let o = 0;
+		let bad = false;
+		while (o < opts.length) {
+			if (opts.length - o < 4) {
+				bad = true;
+				break;
+			}
+			const code = (opts[o] << 8) | opts[o + 1];
+			const olen = (opts[o + 2] << 8) | opts[o + 3];
+			const dataStart = o + 4;
+			if (dataStart + olen > opts.length) {
+				bad = true;
+				break;
+			}
+			const data = opts.subarray(dataStart, dataStart + olen);
+			if (code === 8) {
+				const c = coarseEcsData(data);
+				if (c === null) {
+					bad = true;
+					break;
+				}
+				rebuilt.push(0, 8, c.length >> 8, c.length & 0xff, ...c);
+			} else if (!DROP_OPTIONS.has(code)) {
+				rebuilt.push(opts[o], opts[o + 1], opts[o + 2], opts[o + 3], ...data);
+			}
+			o = dataStart + olen;
+		}
+		if (bad) {
+			droppedRrs++;
+		} else {
+			fixed[fixed.length - 2] = rebuilt.length >> 8;
+			fixed[fixed.length - 1] = rebuilt.length & 0xff;
+			out.push(...fixed, ...rebuilt);
+		}
+		off = rrEnd;
+	}
+	if (droppedRrs === 0 && out.length === msg.length - extraStart) return msg;
+	const res = new Uint8Array(extraStart + out.length);
+	res.set(msg.subarray(0, extraStart), 0);
+	res.set(out, extraStart);
+	const rdv = new DataView(res.buffer, res.byteOffset, res.byteLength);
+	rdv.setUint16(10, arcount - droppedRrs);
+	return res;
+}
+
+/** Malformed OPT encountered: remove every ADDITIONAL RR (fail-closed). */
+function dropAllOpt(msg: Uint8Array, q: Question, extraStart: number): Uint8Array {
+	const res = msg.slice(0, extraStart);
+	new DataView(res.buffer, res.byteOffset, res.byteLength).setUint16(10, 0);
+	return res;
+}
+
+/** Replace the query ID with a random one; returns the client's original ID. */
+export function randomId(msg: Uint8Array): { msg: Uint8Array; id: number } {
+	const out = msg.slice();
+	const id = (out[0] << 8) | out[1];
+	const r = new Uint8Array(2);
+	crypto.getRandomValues(r);
+	out[0] = r[0];
+	out[1] = r[1];
+	return { msg: out, id };
+}
+
+/** Stamp the client's original ID back into an upstream response. */
+export function setMsgId(msg: Uint8Array, id: number): Uint8Array {
+	const out = msg.slice();
+	out[0] = id >> 8;
+	out[1] = id & 0xff;
+	return out;
+}
+
+/**
+ * Coarsen a JSON-API `edns_client_subnet` value ("ip[/len]") the same way as
+ * wire ECS. Returns null when the value is not a parseable address.
+ */
+export function coarseEcsParam(v: string): string | null {
+	const [ipPart, lenPart] = v.split("/");
+	const isV6 = ipPart.includes(":");
+	const bytes = isV6 ? parseIpv6(ipPart) : parseIpv4(ipPart);
+	if (bytes === null) return null;
+	const cap = isV6 ? ECS_CAP_V6 : ECS_CAP_V4;
+	const full = isV6 ? 128 : 32;
+	let prefix = lenPart !== undefined ? Number(lenPart) : full;
+	if (!Number.isInteger(prefix) || prefix < 0 || prefix > full) return null;
+	if (prefix > cap) prefix = cap;
+	const keep = Math.ceil(prefix / 8);
+	for (let i = keep; i < bytes.length; i++) bytes[i] = 0;
+	const addr = isV6 ? fmtIpv6(bytes) : bytes.join(".");
+	return `${addr}/${prefix}`;
+}
+
+function parseIpv4(s: string): Uint8Array | null {
+	const p = s.split(".");
+	if (p.length !== 4) return null;
+	const b = new Uint8Array(4);
+	for (let i = 0; i < 4; i++) {
+		if (!/^\d{1,3}$/.test(p[i]) || +p[i] > 255) return null;
+		b[i] = +p[i];
+	}
+	return b;
+}
+
+function parseIpv6(s: string): Uint8Array | null {
+	const parts = s.split("::");
+	if (parts.length > 2) return null;
+	const groups = (str: string): number[] | null => {
+		if (str === "") return [];
+		const g = str.split(":");
+		const out: number[] = [];
+		for (const x of g) {
+			if (!/^[0-9a-fA-F]{1,4}$/.test(x)) return null;
+			out.push(parseInt(x, 16));
+		}
+		return out;
+	};
+	const head = groups(parts[0]);
+	if (head === null) return null;
+	let gs = head;
+	if (parts.length === 2) {
+		const tail = groups(parts[1]);
+		if (tail === null) return null;
+		if (head.length + tail.length > 8) return null;
+		gs = [...head, ...new Array(8 - head.length - tail.length).fill(0), ...tail];
+	}
+	if (gs.length !== 8) return null;
+	const b = new Uint8Array(16);
+	const dv = new DataView(b.buffer);
+	for (let i = 0; i < 8; i++) dv.setUint16(i * 2, gs[i]);
+	return b;
+}
+
+function fmtIpv6(b: Uint8Array): string {
+	const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+	const g: string[] = [];
+	for (let i = 0; i < 8; i++) g.push(dv.getUint16(i * 2).toString(16));
+	return g.join(":");
+}

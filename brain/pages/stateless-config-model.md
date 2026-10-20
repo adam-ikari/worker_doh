@@ -4,7 +4,7 @@ title: "配置模型：无状态、每请求 URL 参数"
 category: decision
 status: active
 created: "2026-10-18T04:51:05"
-updated: "2026-10-18T16:01:02"
+updated: "2026-10-20T07:49:06"
 ---
 
 <!-- compiled_truth -->
@@ -66,3 +66,9 @@ DoH worker 的用户级配置完全无状态：配置编码在请求 URL 的 que
   summary: "配置页 UI 重设计为「DoH 控制台」：双主题（prefers-color-scheme + 三态手动切换）、高级规则编辑器（AGH 语法在浏览器端映射为 block/allow/host 参数，服务端零改动、语义不变）、在线测试面板渲染 rcode 徽章/记录表格、平台接入片段 tabs。规则编辑器仅是客户端参数生成器，服务端仍不认识 AGH 原文。"
   source: "src/page.ts 重写 + scripts/test.ts 内联 JS 语法校验"
   affects: [src/page.ts]
+
+- time: 2026-10-20T07:49:06
+  kind: decision
+  summary: "出站查询防客户端 IP 泄漏（零配置常开）：ECS 前缀截断粗化到 v4 /8、v6 /32（区域保留、精度移除，RFC 7871 低位清零），剥离 Client/Server Cookie、Padding、Client Tag，查询 ID 随机化并在应答回写客户端原 ID；JSON API 的 edns_client_subnet 同样粗化。顺带修复既有 bug：edge cache HIT 曾把首个请求者的响应 ID 发给所有客户端（严格 DoH 客户端会拒收），现统一出口重写。"
+  source: src/dnsmsg.ts scrubQuery/randomId/setMsgId/coarseEcsParam
+  affects: [src/dnsmsg.ts, src/index.ts]

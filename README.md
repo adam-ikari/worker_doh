@@ -90,7 +90,11 @@ address=/fix.example/5.6.7.8   # answer A (dnsmasq)
 > [!WARNING]
 > Configuration travels as **plaintext URL params** and the endpoint has **no authentication**. Anyone who sees the URL can see and reuse your blocked domains, pinned hosts, and subscriptions. Use the `/p/<base64url>` form to keep domains out of logs (it encodes, it does not encrypt), or keep private domains in deploy-time env vars.
 
-Upstream forwarding carries only the DNS question itself (`name`, `type`, and EDNS options) — config params are never leaked to third-party upstreams.
+Upstream forwarding carries only the DNS question itself (`name`, `type`, DNSSEC `do`) — config params are never leaked to third-party upstreams. Client identity inside the query is scrubbed before it leaves the edge (always on, zero config):
+
+- **EDNS Client Subnet is coarsened** to the client's `/8` (IPv4) or `/32` (IPv6) region block — upstreams still geo-point to the right region, but can no longer locate the client's `/24`.
+- **Tracking options are stripped**: EDNS Client/Server Cookie, Padding (size fingerprinting) and Client Tag never reach upstreams.
+- **Query IDs are randomized** toward upstreams and restamped to the client's original ID on the way back (this also fixes cached replies being served with a foreign ID).
 
 ## Development
 

@@ -1,4 +1,4 @@
-import { buildReply, minAnswerTtl, parseQuestion, RCODE_NXDOMAIN, isStandardQuery, typeName } from "./dnsmsg";
+import { buildReply, minAnswerTtl, parseQuestion, RCODE_NXDOMAIN, isStandardQuery, typeName, scrubQuery, randomId, setMsgId, coarseEcsParam } from "./dnsmsg";
 import { getRules, getRulesFor, isBlocked, lookupHost } from "./rules";
 import { resolveJson, resolveWire, regionFor, type RegionSel, UpstreamError } from "./upstream";
 import { hasOpts, optsHash, parseOpts, type RequestOpts } from "./opts";
@@ -86,14 +86,28 @@ export default {
 			}
 
 			// ---- edge cache per RFC 8484 §5.1 (HTTP cache informed by DNS TTL) ----
+			// cached bytes carry some other client's ID — always restamp below
+			const clientId = (query[0] << 8) | query[1];
 			const cached = await cache.match(cacheKey);
-			if (cached) return cached;
+			if (cached) {
+				const body = setMsgId(new Uint8Array(await cached.arrayBuffer()), clientId);
+				return new Response(body as unknown as BodyInit, {
+					status: 200,
+					headers: new Headers({
+						"content-type": CT_WIRE,
+						"cache-control": cached.headers.get("cache-control") ?? "no-store",
+						"cf-cache-status": "HIT",
+						...CORS,
+					}),
+				});
+			}
 
-			// dedupe keys carry region + config hash: a plain query must never
-			// share an in-flight filtered/other-region result (or vice versa)
+			// never forward client identity: coarsen ECS, drop cookies/padding,
+			// and randomize the query ID (restamped on the way back)
+			const fwd = randomId(scrubQuery(query));
 			const out = await resolveWire(
 				env,
-				query,
+				fwd.msg,
 				`${q.name}/${q.type}${rtag}${hash}`,
 				hasOpts(opts) ? opts : undefined,
 				region,
@@ -101,7 +115,7 @@ export default {
 			const minTtl = minAnswerTtl(new Uint8Array(out.body));
 			const ttl = minTtl === null ? 0 : Math.min(minTtl, URL_TTL_CEILING);
 
-			return wireReply(ctx, cacheKey, new Uint8Array(out.body), ttl);
+			return wireReply(ctx, cacheKey, setMsgId(new Uint8Array(out.body), fwd.id), ttl);
 		} catch (err) {
 			if (err instanceof UpstreamError) {
 				return text("upstream DNS servers unavailable", 502);
@@ -212,11 +226,17 @@ async function handleJson(
 	const name = (sp.get("name") ?? "").toLowerCase().replace(/\.+$/, "");
 	if (!/^[a-z0-9._-]+$/.test(name)) return text("bad name", 400);
 	// forward only the DNS question — block/host/up/list are private config and
-	// must not leak to third-party upstreams
+	// must not leak to third-party upstreams; ECS (if any) is coarsened first
 	const params = new URLSearchParams();
 	for (const k of ["type", "do", "edns_client_subnet"]) {
 		const v = sp.get(k);
-		if (v !== null) params.set(k, v);
+		if (v === null) continue;
+		if (k === "edns_client_subnet") {
+			const coarse = coarseEcsParam(v);
+			if (coarse !== null) params.set(k, coarse);
+		} else {
+			params.set(k, v);
+		}
 	}
 	params.set("name", name);
 	const typeStr = typeNameOf(params);
