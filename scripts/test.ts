@@ -5,19 +5,35 @@
 import assert from "node:assert/strict";
 import {
 	buildReply,
+	encodeName,
 	isStandardQuery,
 	minAnswerTtl,
 	parseQuestion,
 	RCODE_NXDOMAIN,
+	RCODE_REFUSED,
 	scrubQuery,
 	randomId,
 	setMsgId,
 	coarseEcsParam,
 } from "../src/dnsmsg";
-import { isBlocked, lookupHost, parseRuleSource } from "../src/rules";
+import { isBlocked, lookupFixed, parseRuleSource } from "../src/rules";
+import type { Rules } from "../src/rules";
 import { canonicalOpts, hasOpts, optsHash, optsToParams, parseOpts } from "../src/opts";
 import { regionFor } from "../src/upstream";
 import { configPage } from "../src/page";
+
+function mkRules(): Rules {
+	return {
+		blocked: new Set<string>(),
+		allowed: new Set<string>(),
+		hosts: new Map<string, string>(),
+		aaaa: new Map<string, string>(),
+		cnames: new Map<string, string>(),
+		blockRx: [],
+		allowRx: [],
+		updatedAt: 0,
+	};
+}
 
 let passed = 0;
 async function ok(name: string, fn: () => void | Promise<void>): Promise<void> {
@@ -79,6 +95,9 @@ await ok("buildReply NXDOMAIN keeps question and clears answer count", () => {
 		reply.subarray(12, 33).every((b, i) => b === query[i + 12]),
 		true,
 	);
+	const refused = buildReply(query, { rcode: RCODE_REFUSED });
+	assert.equal(refused[3] & 0x0f, 5); // REFUSED
+	assert.equal((refused[2] & 0x80) !== 0, true);
 });
 
 await ok("buildReply A answer emits pointer + A record and keeps EDNS", () => {
@@ -93,7 +112,7 @@ await ok("buildReply A answer emits pointer + A record and keeps EDNS", () => {
 	full.set(withOpt);
 	full.set(opt, withOpt.length);
 
-	const reply = buildReply(full, { a: [{ ip: "1.2.3.4" }] });
+	const reply = buildReply(full, { answers: [{ type: 1, data: "1.2.3.4" }] });
 	const dv2 = new DataView(reply.buffer);
 	assert.equal(dv2.getUint16(6), 1); // ANCOUNT
 	assert.equal(dv2.getUint16(10), 1); // ARCOUNT preserved
@@ -120,7 +139,7 @@ await ok("minAnswerTtl scans answers with compressed names", () => {
 });
 
 await ok("rules parse adblock/hosts/dnsmasq formats", () => {
-	const rules = { blocked: new Set<string>(), allowed: new Set<string>(), hosts: new Map<string, string>(), updatedAt: 0 };
+	const rules = mkRules();
 	parseRuleSource(
 		[
 			"# comment",
@@ -138,16 +157,16 @@ await ok("rules parse adblock/hosts/dnsmasq formats", () => {
 	assert.ok(isBlocked(rules, "tracker.net"));
 	assert.ok(isBlocked(rules, "deep.sub.black.io"));
 	assert.equal(isBlocked(rules, "notblack.io"), false);
-	assert.equal(lookupHost(rules, "my.home"), "1.2.3.4");
-	assert.equal(lookupHost(rules, "x.com"), "9.9.9.9");
+	assert.deepEqual(lookupFixed(rules, "my.home", 1), { type: 1, data: "1.2.3.4" });
+	assert.deepEqual(lookupFixed(rules, "x.com", 1), { type: 1, data: "9.9.9.9" });
 	assert.equal(isBlocked(rules, "wrapped.info"), true);
-	assert.equal(lookupHost(rules, "gw.home"), "9.9.9.9");
+	assert.deepEqual(lookupFixed(rules, "gw.home", 1), { type: 1, data: "9.9.9.9" });
 	assert.equal(rules.hosts.has("#"), false); // inline comment not parsed as a domain
 	assert.equal(rules.hosts.has("gateway"), false);
 });
 
 await ok("rules: AGH-style exceptions, wildcards, skipped syntax", () => {
-	const rules = { blocked: new Set<string>(), allowed: new Set<string>(), hosts: new Map<string, string>(), updatedAt: 0 };
+	const rules = mkRules();
 	parseRuleSource(
 		[
 			"||ads.a^",
@@ -170,10 +189,84 @@ await ok("rules: AGH-style exceptions, wildcards, skipped syntax", () => {
 	assert.equal(isBlocked(rules, "www.plain.c"), false);
 	assert.equal(isBlocked(rules, "x.com"), false); // $important line not parsed as a rule
 	assert.equal(isBlocked(rules, "regex.rule"), false);
-	assert.equal(lookupHost(rules, "fix.c"), "5.6.7.8");
+	assert.deepEqual(lookupFixed(rules, "fix.c", 1), { type: 1, data: "5.6.7.8" });
 	// exception beats a hosts override too
 	rules.hosts.set("mail.ok.a", "9.9.9.9");
-	assert.equal(lookupHost(rules, "mail.ok.a"), null);
+	assert.equal(lookupFixed(rules, "mail.ok.a", 1), null);
+});
+
+await ok("rules: IPv6 and CNAME fixed answers, family matching", () => {
+	const rules = mkRules();
+	parseRuleSource(
+		[
+			"address=/v6.example/2001:db8::1",
+			"address=/alias.example/server.lan",
+			"2001:db8::7 nas6.home",
+			"::1 loop.home",
+			"address=/v6-blocked.example/#",
+			":: blocked6.home",
+		].join("\n"),
+		rules,
+	);
+	assert.equal(rules.aaaa.get("v6.example"), "2001:db8::1");
+	assert.deepEqual(lookupFixed(rules, "v6.example", 28), { type: 28, data: "2001:db8::1" });
+	assert.equal(lookupFixed(rules, "v6.example", 1), null); // A query goes upstream
+	assert.equal(rules.cnames.get("alias.example"), "server.lan");
+	assert.deepEqual(lookupFixed(rules, "alias.example", 1), { type: 5, data: "server.lan" });
+	assert.deepEqual(lookupFixed(rules, "alias.example", 28), { type: 5, data: "server.lan" });
+	assert.equal(rules.aaaa.get("nas6.home"), "2001:db8::7");
+	assert.equal(rules.aaaa.get("loop.home"), "::1");
+	assert.ok(isBlocked(rules, "v6-blocked.example"));
+	assert.ok(isBlocked(rules, "blocked6.home"));
+});
+
+await ok("rules: subscription regex block/allow, suffix allow beats regex", () => {
+	const rules = mkRules();
+	parseRuleSource(
+		[
+			"/^ads?\\..*$/",
+			"@@/^ok\\./",
+			"/\\.rx\\.test$/",
+			"@@||safe.rx.test^",
+			"/this is not (a regex/",
+			"/" + "a".repeat(129) + "/",
+		].join("\n"),
+		rules,
+	);
+	assert.equal(rules.blockRx.length, 2); // invalid and >128 chars skipped
+	assert.equal(rules.allowRx.length, 1);
+	assert.ok(isBlocked(rules, "ads.x.com"));
+	assert.ok(isBlocked(rules, "ad.x.com"));
+	assert.equal(isBlocked(rules, "ok.anything"), false);
+	assert.ok(isBlocked(rules, "a.rx.test"));
+	assert.equal(isBlocked(rules, "x.safe.rx.test"), false); // domain allowlist wins
+	assert.equal(isBlocked(rules, "example.com"), false);
+
+	// regex allow also disables fixed answers
+	const rules2 = mkRules();
+	parseRuleSource("@@/^pin\\./\naddress=/pin.ok/1.2.3.4\naddress=/fixed.home/9.9.9.9", rules2);
+	assert.equal(lookupFixed(rules2, "pin.ok", 1), null);
+	assert.deepEqual(lookupFixed(rules2, "fixed.home", 1), { type: 1, data: "9.9.9.9" });
+});
+
+await ok("buildReply AAAA and CNAME record layouts", () => {
+	const q6 = queryWire("v6.example", 28);
+	const r6 = buildReply(q6, { answers: [{ type: 28, data: "2001:db8::1" }] });
+	const dv6 = new DataView(r6.buffer);
+	assert.equal(dv6.getUint16(6), 1); // ANCOUNT
+	assert.equal(dv6.getUint16(q6.length + 2), 28); // TYPE AAAA
+	assert.equal(dv6.getUint16(q6.length + 4), 1); // CLASS IN
+	assert.equal(dv6.getUint16(q6.length + 10), 16); // RDLENGTH
+	assert.deepEqual(Array.from(r6.subarray(q6.length + 12, q6.length + 28)), [
+		0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+	]);
+
+	const qc = queryWire("alias.example", 1);
+	const rc = buildReply(qc, { answers: [{ type: 5, data: "server.lan" }] });
+	const dvc = new DataView(rc.buffer);
+	assert.equal(dvc.getUint16(qc.length + 2), 5); // TYPE CNAME
+	assert.equal(dvc.getUint16(qc.length + 10), 12); // RDLENGTH
+	assert.deepEqual(Array.from(rc.subarray(qc.length + 12)), Array.from(encodeName("server.lan")));
 });
 
 await ok("opts: allow round-trips and partitions the cache hash", async () => {
@@ -198,6 +291,20 @@ await ok("opts parse, validate, and reject SSRF-ish urls", () => {
 	assert.deepEqual(r.opts.block, ["ads.example.com", "tracker.net"]);
 	assert.equal(r.opts.hosts.get("my.home"), "1.2.3.4");
 	assert.deepEqual(r.opts.up, ["https://dns.google/dns-query"]);
+	assert.equal(r.opts.blockMode, "");
+
+	// fixed-answer targets: IPv4 / IPv6 / CNAME domain, all in host=
+	const v = parseOpts(new URLSearchParams("host=nas6.home/2001:DB8::9,blog.home/server.lan&bm=REFUSED"));
+	assert.ok(v.ok);
+	assert.equal(v.opts.hosts.get("nas6.home"), "2001:db8::9");
+	assert.equal(v.opts.hosts.get("blog.home"), "server.lan");
+	assert.equal(v.opts.blockMode, "refused");
+	assert.ok(hasOpts(v.opts));
+
+	// block modes: names and both IP families
+	for (const bm of ["nxdomain", "refused", "noaddr", "0.0.0.0", "2001:db8::1", "::"]) {
+		assert.ok(parseOpts(new URLSearchParams(`bm=${bm}`)).ok, `bm=${bm} should parse`);
+	}
 
 	// rejects: non-https, IP literal, localhost/private TLD, query injection, bad host entry
 	for (const qs of [
@@ -209,7 +316,11 @@ await ok("opts parse, validate, and reject SSRF-ish urls", () => {
 		"list=https://169.254.169.254/latest/meta-data",
 		"host=my.home",
 		"host=my.home/999.1.1.1",
+		"host=x/y/z",
+		"host=my.home/not a domain",
 		"block=bad domain",
+		"bm=wat",
+		"bm=1.2.3.999",
 	]) {
 		assert.ok(!parseOpts(new URLSearchParams(qs)).ok, `should reject: ${qs}`);
 	}
@@ -229,6 +340,18 @@ await ok("opts canonical form and hash are order-insensitive", async () => {
 	const r = parseOpts(back);
 	assert.ok(r.ok);
 	assert.equal(canonicalOpts(r.opts), canonicalOpts(a.opts));
+
+	// bm joins the hash only when set; round-trips through optsToParams
+	const withBm = parseOpts(new URLSearchParams("block=x.com&bm=refused"));
+	const plain = parseOpts(new URLSearchParams("block=x.com"));
+	assert.ok(withBm.ok && plain.ok);
+	assert.equal(canonicalOpts(plain.opts).includes("m="), false);
+	assert.equal(canonicalOpts(withBm.opts).includes("m=refused"), true);
+	assert.notEqual(await optsHash(withBm.opts), await optsHash(plain.opts));
+	const bmBack = parseOpts(optsToParams(withBm.opts));
+	assert.ok(bmBack.ok);
+	assert.equal(bmBack.opts.blockMode, "refused");
+	assert.equal(canonicalOpts(bmBack.opts), canonicalOpts(withBm.opts));
 });
 
 await ok("region: country > continent > global, up= wins, malformed skipped", () => {
@@ -264,10 +387,12 @@ await ok("page: dual theme + rules editor anchors, inline JS parses", async () =
 	const html = await page.text();
 	assert.ok(html.includes("@media (prefers-color-scheme: dark)"));
 	assert.ok(html.includes('id="rules"'));
+	assert.ok(html.includes('id="bm"'));
 	assert.ok(html.includes("doh-ui-theme"));
 	const m = html.match(/<script>([\s\S]*)<\/script>/);
 	assert.ok(m && m[1].length > 1000);
 	new Function(m[1]); // throws SyntaxError on broken inline JS
+	assert.ok(m[1].includes("isIpv6"));
 	assert.ok(html.includes("doh.example.com"));
 });
 

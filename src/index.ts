@@ -1,5 +1,5 @@
-import { buildReply, minAnswerTtl, parseQuestion, RCODE_NXDOMAIN, isStandardQuery, typeName, scrubQuery, randomId, setMsgId, coarseEcsParam } from "./dnsmsg";
-import { getRules, getRulesFor, isBlocked, lookupHost } from "./rules";
+import { buildReply, minAnswerTtl, parseQuestion, RCODE_NOERROR, RCODE_NXDOMAIN, RCODE_REFUSED, isStandardQuery, typeName, scrubQuery, randomId, setMsgId, coarseEcsParam, parseIpv4, parseIpv6 } from "./dnsmsg";
+import { getRules, getRulesFor, isBlocked, lookupFixed } from "./rules";
 import { resolveJson, resolveWire, regionFor, type RegionSel, UpstreamError } from "./upstream";
 import { hasOpts, optsHash, parseOpts, type RequestOpts } from "./opts";
 import { configPage } from "./page";
@@ -75,14 +75,13 @@ export default {
 			const rules = hasOpts(opts)
 				? await getRulesFor(env, opts)
 				: await getRules(env);
-			if (isBlocked(rules, q.name)) {
-				return wireReply(ctx, cacheKey, buildReply(query, { rcode: RCODE_NXDOMAIN }), BLOCK_TTL);
+			const fixed = lookupFixed(rules, q.name, q.type);
+			if (fixed) {
+				return wireReply(ctx, cacheKey, buildReply(query, { answers: [fixed], ttl: HOSTS_TTL }), HOSTS_TTL);
 			}
-			if (q.type === 1) {
-				const ip = lookupHost(rules, q.name);
-				if (ip) {
-					return wireReply(ctx, cacheKey, buildReply(query, { a: [{ ip }], ttl: HOSTS_TTL }), HOSTS_TTL);
-				}
+			if (isBlocked(rules, q.name)) {
+				const plan = blockPlan(opts.blockMode || env.BLOCK_MODE || "nxdomain");
+				return wireReply(ctx, cacheKey, blockReply(query, q.type, plan), BLOCK_TTL);
 			}
 
 			// ---- edge cache per RFC 8484 §5.1 (HTTP cache informed by DNS TTL) ----
@@ -242,18 +241,26 @@ async function handleJson(
 	const typeStr = typeNameOf(params);
 
 	const rules = hasOpts(opts) ? await getRulesFor(env, opts) : await getRules(env);
-	if (isBlocked(rules, name)) {
-		return jsonResponse({ Status: RCODE_NXDOMAIN, Question: [{ name, type: typeStr }] });
+	const qtype = qtypeOf(params);
+	const fixed = lookupFixed(rules, name, qtype);
+	if (fixed) {
+		return jsonResponse({
+			Status: RCODE_NOERROR,
+			Question: [{ name, type: typeStr }],
+			Answer: [{ name, type: fixed.type, TTL: 300, data: fixed.data }],
+		});
 	}
-	if (typeStr === "A") {
-		const ip = lookupHost(rules, name);
-		if (ip) {
-			return jsonResponse({
-				Status: 0,
-				Question: [{ name, type: 1 }],
-				Answer: [{ name, type: 1, TTL: 300, data: ip }],
-			});
+	if (isBlocked(rules, name)) {
+		const plan = blockPlan(opts.blockMode || env.BLOCK_MODE || "nxdomain");
+		const family = plan.ip?.includes(":") ? 28 : 1;
+		const body: Record<string, unknown> = {
+			Status: plan.rcode,
+			Question: [{ name, type: typeStr }],
+		};
+		if (plan.ip && qtype === family) {
+			body.Answer = [{ name, type: qtype, TTL: 300, data: plan.ip }];
 		}
+		return jsonResponse(body);
 	}
 
 	const out = await resolveJson(env, params, region);
@@ -284,6 +291,44 @@ function typeNameOf(params: URLSearchParams): string {
 	if (!t || t === "") return "A";
 	if (/^\d+$/.test(t)) return typeName(Number(t));
 	return t.toUpperCase();
+}
+
+const QTYPE_BY_NAME: Record<string, number> = {
+	A: 1, NS: 2, CNAME: 5, SOA: 6, PTR: 12, MX: 15, TXT: 16,
+	AAAA: 28, SRV: 33, SVCB: 64, HTTPS: 65,
+};
+
+function qtypeOf(params: URLSearchParams): number {
+	const t = params.get("type");
+	if (!t) return 1;
+	if (/^\d+$/.test(t)) return Number(t);
+	return QTYPE_BY_NAME[t.toUpperCase()] ?? -1;
+}
+
+interface BlockPlan {
+	/** rcode used when no IP answer applies */
+	rcode: number;
+	/** family-matched literal to answer with, or null */
+	ip: string | null;
+}
+
+function blockPlan(mode: string): BlockPlan {
+	const m = mode.trim().toLowerCase();
+	if (!m || m === "nxdomain") return { rcode: RCODE_NXDOMAIN, ip: null };
+	if (m === "refused") return { rcode: RCODE_REFUSED, ip: null };
+	if (m === "noaddr") return { rcode: RCODE_NOERROR, ip: null };
+	if (parseIpv4(m) || parseIpv6(m)) return { rcode: RCODE_NOERROR, ip: m };
+	return { rcode: RCODE_NXDOMAIN, ip: null }; // bad env value: safe default
+}
+
+/** Wire reply for a blocked name; an IP mode only answers the matching family. */
+function blockReply(query: Uint8Array, qtype: number, plan: BlockPlan): Uint8Array {
+	if (!plan.ip) return buildReply(query, { rcode: plan.rcode });
+	const family = plan.ip.includes(":") ? 28 : 1;
+	return buildReply(query, {
+		rcode: RCODE_NOERROR,
+		answers: qtype === family ? [{ type: family, data: plan.ip }] : [],
+	});
 }
 
 function jsonResponse(obj: Record<string, unknown>): Response {

@@ -7,6 +7,7 @@
 
 export const RCODE_NOERROR = 0;
 export const RCODE_NXDOMAIN = 3;
+export const RCODE_REFUSED = 5;
 
 export interface Question {
 	/** lowercase name, trailing dot stripped */
@@ -138,15 +139,22 @@ export function minAnswerTtl(msg: Uint8Array): number | null {
 	return Number.isFinite(minTtl) ? minTtl : null;
 }
 
+export interface FixedAnswer {
+	/** 1 = A, 28 = AAAA, 5 = CNAME */
+	type: number;
+	/** IPv4/IPv6 literal, or a domain name for CNAME */
+	data: string;
+}
+
 /**
  * Build a reply from the original query: header patched to a response, the
- * question echoed back verbatim, plus optional A answers. When the query
- * carried records in the additional section (typically an EDNS OPT), those
- * bytes are copied through untouched so OPT round-trips.
+ * question echoed back verbatim, plus optional answers (A / AAAA / CNAME).
+ * When the query carried records in the additional section (typically an EDNS
+ * OPT), those bytes are copied through untouched so OPT round-trips.
  */
 export function buildReply(
 	query: Uint8Array,
-	opts: { rcode?: number; a?: Array<{ ip: string }>; ttl?: number } = {},
+	opts: { rcode?: number; answers?: FixedAnswer[]; ttl?: number } = {},
 ): Uint8Array {
 	const q = parseQuestion(query);
 	if (!q) throw new Error("invalid query");
@@ -162,10 +170,11 @@ export function buildReply(
 		}
 	}
 
-	const answers = opts.a ?? [];
-	const out = new Uint8Array(q.end + answers.length * 16 + extras.length);
+	const answers = (opts.answers ?? []).map((a) => ({ type: a.type, rd: encodeRdata(a) }));
+	const answersLen = answers.reduce((n, a) => n + 12 + a.rd.length, 0);
+	const out = new Uint8Array(q.end + answersLen + extras.length);
 	out.set(query.subarray(0, q.end), 0);
-	out.set(extras, q.end + answers.length * 16);
+	out.set(extras, q.end + answersLen);
 
 	const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
 	// QR=1, AA=1; keep opcode
@@ -180,16 +189,43 @@ export function buildReply(
 	let off = q.end;
 	for (const ans of answers) {
 		dv.setUint16(off, 0xc00c); // NAME: pointer to the question name
-		dv.setUint16(off + 2, 1); // TYPE A
+		dv.setUint16(off + 2, ans.type);
 		dv.setUint16(off + 4, 1); // CLASS IN
 		dv.setUint32(off + 6, opts.ttl ?? 300);
-		dv.setUint16(off + 10, 4); // RDLENGTH
-		const ip = ans.ip.split(".");
-		out[off + 12] = Number(ip[0]);
-		out[off + 13] = Number(ip[1]);
-		out[off + 14] = Number(ip[2]);
-		out[off + 15] = Number(ip[3]);
-		off += 16;
+		dv.setUint16(off + 10, ans.rd.length);
+		out.set(ans.rd, off + 12);
+		off += 12 + ans.rd.length;
+	}
+	return out;
+}
+
+function encodeRdata(a: FixedAnswer): Uint8Array {
+	if (a.type === 1) {
+		const b = parseIpv4(a.data);
+		if (!b) throw new Error(`bad IPv4 in answer: ${a.data}`);
+		return b;
+	}
+	if (a.type === 28) {
+		const b = parseIpv6(a.data);
+		if (!b) throw new Error(`bad IPv6 in answer: ${a.data}`);
+		return b;
+	}
+	if (a.type === 5) return encodeName(a.data);
+	throw new Error(`unsupported answer type ${a.type}`);
+}
+
+/** Encode a domain name as uncompressed DNS labels (no trailing dot). */
+export function encodeName(name: string): Uint8Array {
+	const body = name.replace(/\.+$/, "");
+	if (!body) throw new Error("empty name");
+	const labels = body.split(".");
+	const len = labels.reduce((n, l) => n + 1 + l.length, 1);
+	const out = new Uint8Array(len);
+	let off = 0;
+	for (const label of labels) {
+		if (label.length === 0 || label.length > 63) throw new Error(`bad label: ${label}`);
+		out[off++] = label.length;
+		for (const c of label) out[off++] = c.charCodeAt(0) & 0xff;
 	}
 	return out;
 }
@@ -408,7 +444,7 @@ export function coarseEcsParam(v: string): string | null {
 	return `${addr}/${prefix}`;
 }
 
-function parseIpv4(s: string): Uint8Array | null {
+export function parseIpv4(s: string): Uint8Array | null {
 	const p = s.split(".");
 	if (p.length !== 4) return null;
 	const b = new Uint8Array(4);
@@ -419,7 +455,7 @@ function parseIpv4(s: string): Uint8Array | null {
 	return b;
 }
 
-function parseIpv6(s: string): Uint8Array | null {
+export function parseIpv6(s: string): Uint8Array | null {
 	const parts = s.split("::");
 	if (parts.length > 2) return null;
 	const groups = (str: string): number[] | null => {

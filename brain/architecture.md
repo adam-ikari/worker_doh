@@ -2,22 +2,22 @@
 slug: architecture
 title: System architecture
 role: system architecture
-updated: "2026-10-18T04:51:38"
+updated: "2026-10-20T09:18:19"
 ---
 
 # System architecture
 
 ## Overview
 
-Cloudflare Worker 单文件部署（无构建、无外部依赖），四层：
+Cloudflare Worker 单文件部署（无构建、无外部依赖），五层：
 
 | 模块 | 职责 |
 |---|---|
 | `src/index.ts` | 路由与响应编排：wire（`/dns-query`、`/p/…`、POST）、JSON 调试 API（`/?name=`）、配置页（`GET /`）、边缘缓存接线 |
-| `src/opts.ts` | 每请求 URL 配置参数（block/host/up/list）的解析、安全校验、规范化与 `optsHash`；页面与 worker 共用同一编解码（见 [[stateless-config-model]]） |
-| `src/rules.ts` | 规则集：env 部署级（BLOCK_DOMAINS/BLOCKLIST_URL，isolate 6h 缓存）与 URL 参数并集合并；`isBlocked`/`lookupHost` 后缀匹配；远程 list 拉取走 isolate 10 分钟缓存 |
+| `src/opts.ts` | 每请求 URL 配置参数（block/allow/host/bm/up/list）的解析、安全校验、规范化与 `optsHash`；页面与 worker 共用同一编解码（见 [[stateless-config-model]]） |
+| `src/rules.ts` | 规则集：env 部署级（BLOCK_DOMAINS/BLOCKLIST_URL，isolate 6h 缓存）与 URL 参数并集合并；`isBlocked` 域名后缀/订阅正则匹配，`lookupFixed` 返回 A/AAAA/CNAME 固定应答；远程 list 拉取走 isolate 10 分钟缓存 |
 | `src/upstream.ts` | 上游 DoH 竞速与 sticky 最快选择；`up` 参数覆盖时不粘滞；JSON 路径把 `/dns-query` 映射到 `/resolve` |
-| `src/dnsmsg.ts` | RFC 1035 报文编解码：parseQuestion/buildReply/minAnswerTtl（纯函数，单测覆盖） |
+| `src/dnsmsg.ts` | RFC 1035 报文编解码：parseQuestion/buildReply（A/AAAA/CNAME 应答）/minAnswerTtl（纯函数，单测覆盖） |
 | `src/page.ts` | 配置页 HTML（内联 JS，无框架），只负责拼参数生成 URL，不写存储 |
 
 ## Module graph

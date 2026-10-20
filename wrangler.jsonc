@@ -30,6 +30,11 @@
 		// hosts / dnsmasq address= formats), comma-separated multiple URLs,
 		// each refreshed every 6h. Example:
 		// "BLOCKLIST_URL": "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts,https://adguard-dns.io/filter.txt"
-		"BLOCKLIST_URL": ""
+		"BLOCKLIST_URL": "",
+
+		// Default reply for blocked names: "nxdomain" (default), "refused",
+		// "noaddr" (NOERROR, empty answer) or an IPv4/IPv6 literal. A request
+		// can override it with ?bm=.
+		"BLOCK_MODE": ""
 	}
 }

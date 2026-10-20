@@ -50,6 +50,9 @@ button.primary:hover{opacity:.9;color:#fff}
 .chip{font-size:.74rem;color:var(--muted);border:1px solid var(--line);border-radius:99px;padding:.05rem .55rem;white-space:nowrap}
 .chip.warnlong{color:var(--warn);border-color:var(--warn);background:var(--warnsoft)}
 .hint{color:var(--muted);font-size:.8rem;margin:.55rem 0 0}
+.bmrow{margin-top:.55rem}
+.bmrow label{font-size:.85rem;color:var(--muted);white-space:nowrap}
+.bmrow select{width:auto;flex:1;min-width:9rem}
 .purlrow{font-size:.78rem;color:var(--muted)}
 .purlrow .url{overflow-wrap:anywhere}
 .tag{display:inline-block;font-size:.72rem;border-radius:5px;padding:.02rem .45rem;margin-right:.45rem;vertical-align:.08rem}
@@ -97,13 +100,22 @@ summary{cursor:pointer;font-weight:600;color:var(--ink)}
 
 <div class="grid">
  <section class="card"><h2>封禁域名 <small>block= · 含子域</small></h2>
- <textarea id="block" placeholder="ads.example.com, tracker.example.net"></textarea></section>
+ <textarea id="block" placeholder="ads.example.com, tracker.example.net"></textarea>
+ <div class="row bmrow"><label for="bm">拦截模式</label>
+ <select id="bm">
+  <option value="">NXDOMAIN（默认）</option>
+  <option value="refused">REFUSED</option>
+  <option value="noaddr">空应答 NOERROR</option>
+  <option value="0.0.0.0">0.0.0.0（A）</option>
+  <option value="::">::（AAAA）</option>
+ </select></div></section>
 
  <section class="card"><h2>例外域名 <small>allow= · 白名单，优先级最高</small></h2>
  <textarea id="allow" placeholder="cdn.example.com&#10;mail.example.net"></textarea></section>
 
- <section class="card wide"><h2>域名固定解析 <small>host= · 每行 域名/IP</small></h2>
- <textarea id="host" placeholder="router.home/192.168.1.1&#10;nas.home/192.168.1.9"></textarea></section>
+ <section class="card wide"><h2>域名固定解析 <small>host= · 每行 域名/目标</small></h2>
+ <textarea id="host" placeholder="router.home/192.168.1.1&#10;nas6.home/2001:db8::9&#10;blog.home/server.lan" style="min-height:5.6rem"></textarea>
+ <p class="hint">目标为 IPv4 → A 应答；IPv6 → AAAA；域名 → CNAME。命中时不出网。</p></section>
 
  <section class="card"><h2>上游 DoH 覆盖 <small>up= · 仅 https · ≤8 个</small></h2>
  <textarea id="up" placeholder="https://dns.google/dns-query"></textarea></section>
@@ -134,9 +146,10 @@ summary{cursor:pointer;font-weight:600;color:var(--ink)}
 <details><summary>使用说明 / 参数含义</summary>
 <table>
 <tr><th>参数</th><th>作用</th></tr>
-<tr><td><code>block</code></td><td>逗号分隔域名，命中返回 NXDOMAIN，后缀匹配（<code>x.com</code> 含子域）</td></tr>
-<tr><td><code>allow</code></td><td>白名单例外，优先级高于 block 与 host 固定应答（含父域例外）</td></tr>
-<tr><td><code>host</code></td><td><code>域名/IP</code> 逗号（或换行）分隔，固定 A 应答</td></tr>
+<tr><td><code>block</code></td><td>逗号分隔域名，命中按拦截模式应答（默认 NXDOMAIN），后缀匹配（<code>x.com</code> 含子域）</td></tr>
+<tr><td><code>allow</code></td><td>白名单例外，优先级高于 block、正则与 host 固定应答（含父域例外）</td></tr>
+<tr><td><code>host</code></td><td><code>域名/目标</code> 逗号（或换行）分隔：IPv4 → A，IPv6 → AAAA，域名 → CNAME；命中时不出网</td></tr>
+<tr><td><code>bm</code></td><td>拦截应答模式：<code>nxdomain</code>（默认）/ <code>refused</code> / <code>noaddr</code>（NOERROR 空应答）/ IPv4 或 IPv6 字面量（按查询族应答，另一族空应答）</td></tr>
 <tr><td><code>up</code></td><td>本次请求的上游 DoH 列表（https、≤8），覆盖服务器默认与地区规则</td></tr>
 <tr><td><code>list</code></td><td>远程过滤器订阅 URL（≤4），语法见下，结果缓存 10 分钟</td></tr>
 <tr><td><em>高级规则</em></td><td>仅本页生效的输入助手：逐行解析后并入 block/allow/host 参数，服务端没有对应的新语义</td></tr>
@@ -144,14 +157,16 @@ summary{cursor:pointer;font-weight:600;color:var(--ink)}
 </table>
 <p>过滤器订阅 / 高级规则支持的语法（域名级子集，仿 AdGuard Home）：
 <code>||域^</code> 拦截、<code>*.域</code> 通配、<code>@@||域^</code> 例外、hosts 文件
-<code>0.0.0.0 域</code> / <code>IP 域</code>、dnsmasq <code>address=/域/IP</code>；
-正则 <code>~</code>、<code>$</code> 修饰符、<code>##</code> 元素规则自动跳过。
+<code>0.0.0.0 域</code> / <code>IP 域</code>（IPv6 亦可）、dnsmasq <code>address=/域/IP</code>
+（IPv6 → AAAA，目标域名 → CNAME）；
+<code>/正则/</code> 与 <code>@@/正则/</code> 仅在订阅（<code>list=</code> / <code>BLOCKLIST_URL</code>）中生效，大小写不敏感、≤128 字符。
+<code>~</code>、<code>$</code> 修饰符、<code>##</code> 元素规则自动跳过。
 优先级：例外 &gt; 固定解析 &gt; 拦截 &gt; 上游解析。</p>
 <p>表单内容保存在<b>本浏览器</b>（localStorage），下次打开自动恢复；服务器依旧无状态。</p>
 </details>
 
 <div class="warn"><b>注意</b>：配置随 URL 明文传输、无鉴权。任何拿到该 URL 的人即可看到并复用你的
-block/allow/host/up/list；请勿在 URL 中使用含隐私的内部域名。需要隐藏时改用 <code>/p/</code> 形式（仅编码，不加密）。
+block/allow/host/bm/up/list；请勿在 URL 中使用含隐私的内部域名。需要隐藏时改用 <code>/p/</code> 形式（仅编码，不加密）。
 地区上游（<code>UPSTREAM_REGIONS</code>）由 Cloudflare 依据你的源 IP 判定，属于部署级配置，不在本页设置。</div>
 
 <script>${JS}</script>
@@ -161,7 +176,7 @@ block/allow/host/up/list；请勿在 URL 中使用含隐私的内部域名。需
 
 const JS = String.raw`
 var $ = function (id) { return document.getElementById(id); };
-var FIELDS = ["block", "allow", "host", "up", "list", "rules"];
+var FIELDS = ["block", "bm", "allow", "host", "up", "list", "rules"];
 var LS = "doh-config-page", LST = "doh-ui-theme";
 
 function splitList(el) {
@@ -179,6 +194,24 @@ function isIpv4(s) {
   var p = s.split(".");
   return p.length === 4 && p.every(function (x) { return /^\d{1,3}$/.test(x) && +x <= 255; });
 }
+function isIpv6(s) {
+  if (!/^[0-9a-f:]+$/i.test(s) || s.indexOf(":") === -1) return false;
+  var parts = s.split("::");
+  if (parts.length > 2) return false;
+  function groups(str) {
+    if (!str) return 0;
+    var g = str.split(":");
+    for (var i = 0; i < g.length; i++) if (!/^[0-9a-f]{1,4}$/i.test(g[i])) return -1;
+    return g.length;
+  }
+  var a = groups(parts[0]), b = parts.length === 2 ? groups(parts[1]) : 0;
+  if (a < 0 || b < 0) return false;
+  return parts.length === 2 ? a + b <= 7 : a === 8;
+}
+function isZeroIp(s) {
+  if (s === "0.0.0.0") return true;
+  return isIpv6(s) && s.split(":").every(function (g) { return g === "" || /^0+$/i.test(g); });
+}
 var DOK = /^[a-z0-9._-]+$/;
 function normDom(s) {
   return s.replace(/^\*\./, "").replace(/^\|\|/, "").replace(/\^.*$/, "").toLowerCase().replace(/\.+$/, "");
@@ -193,6 +226,10 @@ function parseRules(text) {
     if (!line) continue;
     if (/^[#;!]/.test(line)) { r.rows.push({ k: "comment", t: line }); continue; }
     if (/^(##|#@#|~)/.test(line)) { r.rows.push({ k: "skip", t: "元素/正则规则，DNS 层不支持 — " + line }); continue; }
+    if (line.indexOf("@@/") === 0) { r.rows.push({ k: "skip", t: "正则例外仅在订阅（list=）中生效 — " + line }); continue; }
+    if (line.charAt(0) === "/" && line.length > 2 && line.charAt(line.length - 1) === "/") {
+      r.rows.push({ k: "skip", t: "正则规则仅在订阅（list=）中生效 — " + line }); continue;
+    }
     if (line.indexOf("@@") === 0) {
       var ad = normDom(line.slice(2).split("$")[0]);
       if (DOK.test(ad)) { r.allow.push(ad); r.rows.push({ k: "allow", t: ad }); }
@@ -200,25 +237,32 @@ function parseRules(text) {
       continue;
     }
     var toks = line.split(/\s+/), first = toks[0];
-    if (isIpv4(first)) {
+    var v4 = isIpv4(first), v6 = !v4 && isIpv6(first);
+    if (v4 || v6) {
+      var blocked = isZeroIp(first);
       for (var j = 1; j < toks.length; j++) {
         if (toks[j].charAt(0) === "#") break;
         var hd = toks[j].toLowerCase().replace(/\.+$/, "");
         if (!DOK.test(hd)) { r.rows.push({ k: "bad", t: "非法域名: " + toks[j] }); continue; }
-        if (first === "0.0.0.0") { r.block.push(hd); r.rows.push({ k: "block", t: hd }); }
-        else { r.hosts.push(hd + "/" + first); r.rows.push({ k: "host", t: hd + " → " + first }); }
+        if (blocked) { r.block.push(hd); r.rows.push({ k: "block", t: hd }); }
+        else { r.hosts.push(hd + "/" + first.toLowerCase()); r.rows.push({ k: "host", t: hd + " → " + first }); }
       }
       continue;
     }
     var m = line.match(/^address=\/([^/]+)(?:\/([^/]*))?/);
     if (m) {
+      var rhs = m[2];
+      if (rhs && rhs !== "#") {
+        if (isIpv6(rhs)) rhs = rhs.toLowerCase();
+        else if (!isIpv4(rhs)) { var ct = normDom(rhs); rhs = DOK.test(ct) && ct.indexOf("/") === -1 && !/^[0-9.]+$/.test(ct) ? ct : ""; }
+      }
       var doms = m[1].split("/");
       for (var k = 0; k < doms.length; k++) {
         var dd = normDom(doms[k]);
         if (!dd) continue;
-        if (m[2] && m[2] !== "#" && isIpv4(m[2])) { r.hosts.push(dd + "/" + m[2]); r.rows.push({ k: "host", t: dd + " → " + m[2] }); }
-        else if (DOK.test(dd)) { r.block.push(dd); r.rows.push({ k: "block", t: dd }); }
-        else r.rows.push({ k: "bad", t: "非法域名: " + doms[k] });
+        if (!DOK.test(dd)) { r.rows.push({ k: "bad", t: "非法域名: " + doms[k] }); continue; }
+        if (rhs && rhs !== "#") { r.hosts.push(dd + "/" + rhs); r.rows.push({ k: "host", t: dd + " → " + rhs }); }
+        else { r.block.push(dd); r.rows.push({ k: "block", t: dd }); }
       }
       continue;
     }
@@ -240,6 +284,8 @@ function collect() {
   $("rulestat").innerHTML = renderRuleStat(pr);
   var p = new URLSearchParams();
   if (block.length) p.set("block", block.join(","));
+  var bm = $("bm").value;
+  if (bm) p.set("bm", bm);
   if (allow.length) p.set("allow", allow.join(","));
   if (hosts.length) p.set("host", hosts.join(","));
   var up = splitList($("up"));
@@ -253,7 +299,7 @@ function esc(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 function renderRuleStat(pr) {
-  if (!pr.rows.length) return '<p class="hint">支持：||域^ 拦截 · @@||域^ 例外 · *.域 通配 · 0.0.0.0 域 · IP 域 · address=/域/IP · 裸域名</p>';
+  if (!pr.rows.length) return '<p class="hint">支持：||域^ 拦截 · @@||域^ 例外 · *.域 通配 · 0.0.0.0/:: 域 · IP 域 · address=/域/IP|IPv6|目标域 · 裸域名 · /正则/ 仅订阅</p>';
   var names = { block: "拦截", allow: "例外", host: "固定", skip: "跳过", bad: "错误", comment: "注释" };
   var inert = pr.rows.filter(function (x) { return x.k === "skip" || x.k === "bad"; }).length;
   var sum = "解析：" + pr.block.length + " 拦截 · " + pr.allow.length + " 例外 · " + pr.hosts.length + " 固定 · " + inert + " 未生效";
@@ -339,7 +385,7 @@ $("tabs").addEventListener("click", function (ev) {
 });
 
 var TN = { 1: "A", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV", 257: "CAA" };
-function rcodeName(s) { return ["NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN"][s] || ("RCODE " + s); }
+function rcodeName(s) { return ["NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED"][s] || ("RCODE " + s); }
 async function test() {
   var p = new URLSearchParams(lastParams);
   var name = $("tq").value.trim();
@@ -383,7 +429,7 @@ Array.prototype.forEach.call(document.querySelectorAll("[data-copy]"), function 
   });
 });
 
-FIELDS.forEach(function (f) { $(f).addEventListener("input", refresh); });
+FIELDS.forEach(function (f) { $(f).addEventListener("input", refresh); $(f).addEventListener("change", refresh); });
 restore();
 try { applyTheme(localStorage.getItem(LST) || "sys"); } catch (e) { applyTheme("sys"); }
 renderTabs();

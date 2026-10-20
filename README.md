@@ -8,7 +8,7 @@ A zero-dependency [Cloudflare Workers](https://workers.cloudflare.com) DNS-over-
 - **JSON debug API** — RFC 8427-style `GET /?name=example.com&type=A` for quick inspection from a browser.
 - **Edge caching** — responses cached in `caches.default`; cache keys are partitioned per configuration set, so filtered and unfiltered queries never cross-contaminate.
 - **Fastest upstream wins** — upstream DoH endpoints are raced; the fastest responder stays sticky until it degrades.
-- **AdGuard-Home-style filtering** — block, allow-list exceptions, fixed-IP overrides, and remote filter subscriptions, in env vars or per request.
+- **AdGuard-Home-style filtering** — block, allow-list exceptions, fixed A/AAAA/CNAME overrides, configurable block replies, and remote filter subscriptions with domain and regex rules.
 - **Stateless config model** — a config page generates a DoH URL carrying every option as query params; paste it into your client and you're done.
 - **SSRF-hardened** — user-supplied `up`/`list` URLs must be https public hosts; embedded query strings, IP literals, localhost and private TLDs are rejected.
 
@@ -50,6 +50,7 @@ Deploy with `npx wrangler deploy` (requires a Cloudflare account; see [Wrangler 
 | `BLOCK_DOMAINS` | — | Comma/space-separated blocked domains (suffix match) |
 | `ALLOW_DOMAINS` | — | Exception domains that override blocks |
 | `BLOCKLIST_URL` | — | Comma-separated remote filter URLs, refreshed every 6 h |
+| `BLOCK_MODE` | `nxdomain` | Default reply for blocked names: `nxdomain`, `refused`, `noaddr`, or an IPv4/IPv6 literal |
 | `UPSTREAM_TIMEOUT_MS` | `5000` | Per-attempt upstream race timeout |
 | `STICKY_TTL_MS` | `300000` | How long the fastest upstream stays selected |
 
@@ -61,13 +62,16 @@ Deploy with `npx wrangler deploy` (requires a Cloudflare account; see [Wrangler 
 |---|---|
 | `block=a.com,b.net` | Blocked domains, union with env |
 | `allow=b.net` | Allow-list exceptions |
-| `host=router.home/192.168.1.1` | Fixed A answers (also newline-separated in the page) |
+| `host=router.home/192.168.1.1` | Fixed answers: IPv4 → A, IPv6 → AAAA, domain → CNAME (also newline-separated in the page) |
+| `bm=refused` | Block reply mode: `nxdomain` / `refused` / `noaddr` / IPv4 / IPv6, overriding `BLOCK_MODE` |
 | `up=https://…` | Per-request upstream list (≤ 8), replaces the default |
 | `list=https://…` | Remote filter subscriptions (≤ 4), cached 10 min |
 
 Request params and env vars merge as a **union** — requests without params behave exactly like a plain deployment.
 
 **Precedence:** `allow` > fixed `host` > `block` > upstream resolution. An exception at any parent level (`@@||example.com^`) lets through everything below it, including fixed-IP overrides.
+
+Blocked names answer NXDOMAIN by default. `bm=` (or deploy-time `BLOCK_MODE`) can switch to REFUSED, an empty NOERROR, or a literal IP sinkhole: `0.0.0.0` answers A queries and `::`/any IPv6 answers AAAA, with the other family getting an empty NOERROR.
 
 ### Filter rule syntax
 
@@ -77,13 +81,18 @@ Remote subscriptions (`BLOCKLIST_URL`, `list=`) accept a domain-level subset of 
 ||ads.example.com^         # block (suffix match: sub.ads.example.com too)
 *.wild.example.com         # block (wildcard)
 @@||cdn.example.com^       # allow exception — beats block and fixed IP
+/^ads?\..*$/               # block by regex, case-insensitive (subscriptions only)
+@@/^ok\./                  # allow by regex (subscriptions only)
 0.0.0.0 tracker.com        # block (hosts file)
 192.168.1.9 nas.home       # answer A 192.168.1.9 (hosts file)
-address=/fix.example/5.6.7.8   # answer A (dnsmasq)
+::1 nas6.home              # answer AAAA ::1 (hosts file)
+address=/fix.example/5.6.7.8       # answer A (dnsmasq)
+address=/v6.example/2001:db8::1    # answer AAAA (dnsmasq)
+address=/blog.example/server.lan   # answer CNAME (dnsmasq)
 ```
 
 > [!NOTE]
-> Full-regex rules (`~…`), ABP `$`-modifier filters, and cosmetic (`##`) rules are skipped — filtering happens at the DNS layer only.
+> Regex rules (`/pattern/`, `@@/pattern/`) work in subscriptions only (`BLOCKLIST_URL`, `list=`), are case-insensitive, and are capped at 128 characters. The per-request `block=` param stays a plain domain list. `~…` raw-regex lines, ABP `$`-modifier filters, and cosmetic (`##`) rules are skipped — filtering happens at the DNS layer only.
 
 ## Privacy & security
 
@@ -109,7 +118,7 @@ src/
   index.ts     routing, edge cache, JSON & wire handlers
   dnsmsg.ts    DNS message encode/decode (labels, pointers, EDNS)
   opts.ts      per-request params: parse, validate, canonical hash
-  rules.ts     rule parser (adblock/hosts/dnsmasq), matching, caches
+  rules.ts     rule parser (adblock/hosts/dnsmasq/regex), matching, caches
   upstream.ts  upstream racing, sticky selection, inflight dedupe
   page.ts      inline config page (no build step)
 ```
